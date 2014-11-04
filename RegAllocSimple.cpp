@@ -36,6 +36,7 @@ namespace {
     private:
       std::unordered_map<unsigned, std::set<unsigned>> AdjList;
       std::unordered_map<unsigned, unsigned> Degree;
+      std::set<unsigned> Nodes;
     
       bool isAdjSet(unsigned u, unsigned v) {
         if (AdjList.find(u) != AdjList.end()) {
@@ -48,6 +49,8 @@ namespace {
       void makeAdjSet(unsigned u, unsigned v) {
         AdjList[u].insert(v);
         AdjList[v].insert(u);
+        Nodes.insert(u);
+        Nodes.insert(v);
       };
 
     public:
@@ -59,6 +62,14 @@ namespace {
           Degree[v] += 1;
         }
       };
+
+      std::set<unsigned>& getNodes() {
+        return Nodes;
+      };
+
+      unsigned getDegree(unsigned reg) {
+        return Degree[reg];
+      }
   };
 
   class RASimple : public MachineFunctionPass {
@@ -79,6 +90,8 @@ namespace {
     typedef std::unordered_map<MachineBasicBlock*, RegsMap>  BBRegsMap;
     BBRegsMap BBRegs;
 
+    std::set<unsigned> UsedPhys;
+
     std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveOutRegs;
     std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveInRegs;
 
@@ -86,6 +99,8 @@ namespace {
     std::set<MachineInstr*> WorklistMoves;
 
     Graph* InterGraph;
+
+    std::set<unsigned> spillWorklist, freezeWorklist, simplifyWorklist;
 
     // state
     Spiller *SpillerInstance;
@@ -125,7 +140,8 @@ namespace {
                         std::set<unsigned>&, std::set<unsigned>&, bool&);
       void getUsesDefs(MachineInstr&, std::set<unsigned>&, std::set<unsigned>&);
       bool isMoveInstr(MachineInstr&);
-
+      void makeWorklist();
+      std::set<uint16_t> getPhysRegs(unsigned);
   };
 
   char RASimple::ID = 0;
@@ -323,7 +339,9 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
       unsigned Reg = oper.getReg();
       if (oper.isUse()) uses.insert(Reg);
       else if (oper.isDef()) defs.insert(Reg);
-    }
+    } 
+    else if (oper.isReg())
+      UsedPhys.insert(oper.getReg());
   }
   //implicit use of registers
   if (Instr.getDesc().getImplicitUses())
@@ -331,6 +349,7 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
                                         *regs; regs++) {
       if (TargetRegisterInfo::isVirtualRegister(*regs))
         uses.insert(*regs);
+      else UsedPhys.insert(*regs);
     }
   //implicit def of registers
   if (Instr.getDesc().getImplicitDefs())
@@ -338,6 +357,7 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
                                         *regs; regs++) {
       if (TargetRegisterInfo::isVirtualRegister(*regs))
         defs.insert(*regs);
+      else UsedPhys.insert(*regs);
     }
 }
 
@@ -389,6 +409,32 @@ void RASimple::buildInterferenceGraph() {
   }
 }
 
+std::set<uint16_t> RASimple::getPhysRegs(unsigned VirtReg) {
+  ArrayRef<uint16_t> PhysRegisters = RegClassInfo.
+                          getOrder(MRI->getRegClass(VirtReg));
+  std::set<uint16_t> AvailablePhys;
+  for (size_t i = 0; i < PhysRegisters.size(); i++) {
+    if (UsedPhys.find(PhysRegisters[i]) == UsedPhys.end())
+      AvailablePhys.insert(PhysRegisters[i]);
+  }
+  return AvailablePhys;
+}
+
+void RASimple::makeWorklist() {
+  for (unsigned VirtReg: InterGraph->getNodes()) {
+    unsigned K = RegClassInfo.getOrder(MRI->getRegClass(VirtReg)).size();
+    std::cout << VirtReg << ": " << K << std::endl;
+//getPhysRegs(VirtReg).size();
+    if (InterGraph->getDegree(VirtReg) >= K)
+      spillWorklist.insert(VirtReg);
+    else if (MoveList.find(VirtReg) != MoveList.end())
+      freezeWorklist.insert(VirtReg);
+    else
+      simplifyWorklist.insert(VirtReg);
+  }
+  std::cout << "\n";
+}
+
 bool RASimple::runOnMachineFunction(MachineFunction &mf) {
   DEBUG(dbgs() << "********** SIMPLE REGISTER ALLOCATION **********\n"
       << "********** Function: "  << mf.getName() << '\n');
@@ -398,6 +444,8 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
   livenessAnalysis();
 
   buildInterferenceGraph();
+
+  makeWorklist();
 
   SpillerInstance = createInlineSpiller(*this, *this->MF, *this->VRM);
 
