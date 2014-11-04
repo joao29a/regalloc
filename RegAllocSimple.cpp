@@ -142,6 +142,7 @@ namespace {
       bool isMoveInstr(MachineInstr&);
       void makeWorklist();
       std::set<uint16_t> getPhysRegs(unsigned);
+      void releaseMemory();
   };
 
   char RASimple::ID = 0;
@@ -184,7 +185,6 @@ void RASimple::init(MachineFunction &MF) {
   this->TRI = this->TM->getRegisterInfo();
   this->VRM = &getAnalysis<VirtRegMap>();
 
-  this->Matrix = &getAnalysis<LiveRegMatrix>();
 
   RegClassInfo.runOnMachineFunction(VRM->getMachineFunction());
 }
@@ -325,6 +325,7 @@ void RASimple::getLiveness() {
 
 void RASimple::livenessAnalysis() {
   this->LIS = &getAnalysis<LiveIntervals>();
+  this->Matrix = &getAnalysis<LiveRegMatrix>();
   getAllRegs();
   getLiveness();
 }
@@ -334,8 +335,7 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
                             std::set<unsigned>& defs) {
   for (unsigned i = 0; i < Instr.getNumOperands(); i++) {
     MachineOperand& oper = Instr.getOperand(i);
-    if (oper.isReg()
-        && TargetRegisterInfo::isVirtualRegister(oper.getReg())) {
+    if (oper.isReg() && TRI->isVirtualRegister(oper.getReg())) {
       unsigned Reg = oper.getReg();
       if (oper.isUse()) uses.insert(Reg);
       else if (oper.isDef()) defs.insert(Reg);
@@ -347,7 +347,7 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
   if (Instr.getDesc().getImplicitUses())
     for (const uint16_t *regs = Instr.getDesc().getImplicitUses(); 
                                         *regs; regs++) {
-      if (TargetRegisterInfo::isVirtualRegister(*regs))
+      if (TRI->isVirtualRegister(*regs))
         uses.insert(*regs);
       else UsedPhys.insert(*regs);
     }
@@ -355,7 +355,7 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
   if (Instr.getDesc().getImplicitDefs())
     for (const uint16_t *regs = Instr.getDesc().getImplicitDefs(); 
                                         *regs; regs++) {
-      if (TargetRegisterInfo::isVirtualRegister(*regs))
+      if (TRI->isVirtualRegister(*regs))
         defs.insert(*regs);
       else UsedPhys.insert(*regs);
     }
@@ -364,6 +364,18 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
 bool RASimple::isMoveInstr(MachineInstr& Instr) {
   if (Instr.isCopyLike()) return true;
   return false;
+}
+
+void RASimple::releaseMemory() {
+  BBRegs.clear();
+  UsedPhys.clear();
+  LiveOutRegs.clear();
+  LiveInRegs.clear();
+  spillWorklist.clear();
+  freezeWorklist.clear();
+  simplifyWorklist.clear();
+  MoveList.clear();
+  WorklistMoves.clear();
 }
 
 void RASimple::buildInterferenceGraph() {
@@ -410,21 +422,18 @@ void RASimple::buildInterferenceGraph() {
 }
 
 std::set<uint16_t> RASimple::getPhysRegs(unsigned VirtReg) {
-  ArrayRef<uint16_t> PhysRegisters = RegClassInfo.
-                          getOrder(MRI->getRegClass(VirtReg));
+  AllocationOrder Order(VirtReg, *VRM, RegClassInfo);
   std::set<uint16_t> AvailablePhys;
-  for (size_t i = 0; i < PhysRegisters.size(); i++) {
-    if (UsedPhys.find(PhysRegisters[i]) == UsedPhys.end())
-      AvailablePhys.insert(PhysRegisters[i]);
+  while (uint16_t reg = Order.next()) {
+    if (UsedPhys.find(reg) == UsedPhys.end())
+      AvailablePhys.insert(reg);
   }
   return AvailablePhys;
 }
 
 void RASimple::makeWorklist() {
   for (unsigned VirtReg: InterGraph->getNodes()) {
-    unsigned K = RegClassInfo.getOrder(MRI->getRegClass(VirtReg)).size();
-    std::cout << VirtReg << ": " << K << std::endl;
-//getPhysRegs(VirtReg).size();
+    unsigned K = getPhysRegs(VirtReg).size();
     if (InterGraph->getDegree(VirtReg) >= K)
       spillWorklist.insert(VirtReg);
     else if (MoveList.find(VirtReg) != MoveList.end())
@@ -432,7 +441,9 @@ void RASimple::makeWorklist() {
     else
       simplifyWorklist.insert(VirtReg);
   }
-  std::cout << "\n";
+  //std::cout << spillWorklist.size() << std::endl;
+  //std::cout << freezeWorklist.size() << std::endl;
+  //std::cout << simplifyWorklist.size() << "\n\n";
 }
 
 bool RASimple::runOnMachineFunction(MachineFunction &mf) {
@@ -452,6 +463,8 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
   allocatePhysRegs();
 
   delete SpillerInstance;
+
+  releaseMemory();
 
   return true;
 }
