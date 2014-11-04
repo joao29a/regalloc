@@ -32,8 +32,36 @@ static RegisterRegAlloc simpleRegAlloc("simple", "simple register allocator",
     createSimpleRegisterAllocator);
 
 namespace {
-  class RASimple : public MachineFunctionPass
-  {
+  class Graph {
+    private:
+      std::unordered_map<unsigned, std::set<unsigned>> AdjList;
+      std::unordered_map<unsigned, unsigned> Degree;
+    
+      bool isAdjSet(unsigned u, unsigned v) {
+        if (AdjList.find(u) != AdjList.end()) {
+          if (AdjList[u].find(v) != AdjList[u].end())
+            return true;
+        }
+        return false;
+      };
+
+      void makeAdjSet(unsigned u, unsigned v) {
+        AdjList[u].insert(v);
+        AdjList[v].insert(u);
+      };
+
+    public:
+      Graph() {};
+      void addEdge(unsigned u , unsigned v) {
+        if ((u != v) && !isAdjSet(u, v)) {
+          makeAdjSet(u, v);
+          Degree[u] += 1;
+          Degree[v] += 1;
+        }
+      };
+  };
+
+  class RASimple : public MachineFunctionPass {
     // context
     MachineFunction *MF;            //check
     const TargetRegisterInfo *TRI;  //check
@@ -53,6 +81,11 @@ namespace {
 
     std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveOutRegs;
     std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveInRegs;
+
+    std::unordered_map<unsigned, std::set<MachineInstr*>> MoveList;
+    std::set<MachineInstr*> WorklistMoves;
+
+    Graph* InterGraph;
 
     // state
     Spiller *SpillerInstance;
@@ -90,6 +123,8 @@ namespace {
       void DFS(MachineBasicBlock&, std::vector<MachineBasicBlock*>&, std::set<MachineBasicBlock*>&);
       void getSuccessor(MachineBasicBlock&, std::set<MachineBasicBlock*>&,
                         std::set<unsigned>&, std::set<unsigned>&, bool&);
+      void getUsesDefs(MachineInstr&, std::set<unsigned>&, std::set<unsigned>&);
+      bool isMoveInstr(MachineInstr&);
 
   };
 
@@ -189,29 +224,12 @@ unsigned RASimple::selectOrSpill(LiveInterval &VirtReg) {
 void RASimple::getAllRegs() {
   for (MachineBasicBlock& MBB: *MF) {
     for (MachineInstr& Instr: MBB) {
-      for (unsigned i = 0; i < Instr.getNumOperands(); i++) {
-        MachineOperand& oper = Instr.getOperand(i);
-        if (oper.isReg()
-            && TargetRegisterInfo::isVirtualRegister(oper.getReg())) {
-          unsigned Reg = oper.getReg();
-          if (oper.isUse()) BBRegs[&MBB].first.insert(Reg);
-          else if (oper.isDef()) BBRegs[&MBB].second.insert(Reg);
-        }
-      }
-      //implicit use of registers
-      if (Instr.getDesc().getImplicitUses())
-        for (const uint16_t *regs = Instr.getDesc().getImplicitUses(); 
-                                            *regs; regs++) {
-          if (TargetRegisterInfo::isVirtualRegister(*regs))
-            BBRegs[&MBB].first.insert(*regs);
-        }
-      //implicit def of registers
-      if (Instr.getDesc().getImplicitDefs())
-        for (const uint16_t *regs = Instr.getDesc().getImplicitDefs(); 
-                                            *regs; regs++) {
-          if (TargetRegisterInfo::isVirtualRegister(*regs))
-            BBRegs[&MBB].second.insert(*regs);
-        }
+      std::set<unsigned> uses, defs;
+      getUsesDefs(Instr, uses, defs);
+      for (unsigned reg: uses)
+        BBRegs[&MBB].first.insert(reg);
+      for (unsigned reg: defs)
+        BBRegs[&MBB].second.insert(reg);
     }
   }
 }
@@ -296,8 +314,78 @@ void RASimple::livenessAnalysis() {
 }
 
 
+void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
+                            std::set<unsigned>& defs) {
+  for (unsigned i = 0; i < Instr.getNumOperands(); i++) {
+    MachineOperand& oper = Instr.getOperand(i);
+    if (oper.isReg()
+        && TargetRegisterInfo::isVirtualRegister(oper.getReg())) {
+      unsigned Reg = oper.getReg();
+      if (oper.isUse()) uses.insert(Reg);
+      else if (oper.isDef()) defs.insert(Reg);
+    }
+  }
+  //implicit use of registers
+  if (Instr.getDesc().getImplicitUses())
+    for (const uint16_t *regs = Instr.getDesc().getImplicitUses(); 
+                                        *regs; regs++) {
+      if (TargetRegisterInfo::isVirtualRegister(*regs))
+        uses.insert(*regs);
+    }
+  //implicit def of registers
+  if (Instr.getDesc().getImplicitDefs())
+    for (const uint16_t *regs = Instr.getDesc().getImplicitDefs(); 
+                                        *regs; regs++) {
+      if (TargetRegisterInfo::isVirtualRegister(*regs))
+        defs.insert(*regs);
+    }
+}
+
+bool RASimple::isMoveInstr(MachineInstr& Instr) {
+  if (Instr.isCopyLike()) return true;
+  return false;
+}
+
 void RASimple::buildInterferenceGraph() {
+  if (InterGraph != nullptr) delete InterGraph;
+  
+  InterGraph = new Graph();
+
   for (MachineBasicBlock& MBB: *MF) {
+    std::set<unsigned> live = LiveOutRegs[&MBB];
+    for (MachineBasicBlock::reverse_instr_iterator instrIt = MBB.instr_rbegin();
+              instrIt != MBB.instr_rend(); instrIt++) {
+      MachineInstr& Instr = *instrIt;
+      std::set<unsigned> uses, defs;
+      getUsesDefs(Instr, uses, defs);
+      if (isMoveInstr(Instr)) {
+        std::set_difference(live.begin(), live.end(),
+                            uses.begin(), uses.end(),
+                            std::inserter(live, live.begin()));
+        
+        std::set<unsigned> UsesDefs;
+        std::set_union(uses.begin(), uses.end(),
+                        defs.begin(), defs.end(),
+                        std::inserter(UsesDefs, UsesDefs.begin()));
+        for (unsigned n: UsesDefs)
+          MoveList[n].insert(&Instr);
+        WorklistMoves.insert(&Instr);
+      }
+      std::set_union(live.begin(), live.end(),
+                      defs.begin(), defs.end(),
+                      std::inserter(live, live.begin()));
+      for (unsigned d: defs) {
+        for (unsigned l: live)
+          InterGraph->addEdge(l, d);
+      }
+      std::set<unsigned> temp;
+      std::set_difference(live.begin(), live.end(),
+                          defs.begin(), defs.end(),
+                          std::inserter(temp, temp.begin()));
+      std::set_union(temp.begin(), temp.end(),
+                      uses.begin(), uses.end(),
+                      std::inserter(live, live.begin()));
+    }
   }
 }
 
