@@ -37,32 +37,28 @@ namespace {
     private:
       std::unordered_map<unsigned, std::set<unsigned>> AdjList;
       std::unordered_map<unsigned, unsigned> Degree;
+      std::set<std::pair<unsigned, unsigned>> AdjSet;
       std::set<unsigned> Nodes;
     
-      bool isAdjSet(unsigned u, unsigned v) {
-        if (AdjList.find(u) != AdjList.end()) {
-          if (AdjList[u].find(v) != AdjList[u].end())
-            return true;
-        }
-        return false;
-      };
-
-      void makeAdjSet(unsigned u, unsigned v) {
-        AdjList[u].insert(v);
-        AdjList[v].insert(u);
-        Nodes.insert(u);
-        Nodes.insert(v);
-      };
-
     public:
       Graph() {};
+
+      void addSet(unsigned u, unsigned v) {
+        AdjSet.insert(std::make_pair(u, v));
+      }
+
+      bool isAdjSet(unsigned u, unsigned v) {
+        if ((AdjSet.find(std::make_pair(u, v)) != AdjSet.end())
+            || (AdjSet.find(std::make_pair(v, u)) != AdjSet.end()))
+          return true;
+        return false;
+      }
+
       void addEdge(unsigned u , unsigned v) {
-        if ((u != v) && !isAdjSet(u, v)) {
-          makeAdjSet(u, v);
+          AdjList[u].insert(v);
           Degree[u] += 1;
-          Degree[v] += 1;
-        }
-      };
+          Nodes.insert(u);
+      }
 
       std::set<unsigned>& getNodes() {
         return Nodes;
@@ -106,13 +102,17 @@ namespace {
     std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveInRegs;
 
     std::unordered_map<unsigned, std::set<MachineInstr*>> MoveList;
-    std::set<MachineInstr*> WorklistMoves, ActiveMoves;
+    std::set<MachineInstr*> WorklistMoves, ActiveMoves, CoalescedMoves, 
+      ConstrainedMoves;
+
+    std::unordered_map<unsigned, unsigned> Alias;
 
     std::list<unsigned> Stack;
 
     Graph* InterGraph;
 
-    std::set<unsigned> SpillWorklist, FreezeWorklist, SimplifyWorklist;
+    std::set<unsigned> SpillWorklist, FreezeWorklist, SimplifyWorklist,
+          CoalescedNodes;
 
     // state
     Spiller *SpillerInstance;
@@ -154,12 +154,21 @@ namespace {
       void getUsesDefs(MachineInstr&, std::set<unsigned>&, std::set<unsigned>&);
       bool isMoveInstr(MachineInstr&);
       void makeWorklist();
+      void addEdge(unsigned, unsigned);
       std::set<uint16_t> getPhysRegs(unsigned);
       void releaseMemory();
       std::set<MachineInstr*> nodeMoves(unsigned);
+      std::set<unsigned> adjacent(unsigned);
+      std::string getRegClassName(unsigned);
       void enableMoves(std::set<unsigned>&);
+      void addWorklist(unsigned);
+      void getMoveReg(MachineInstr*, unsigned&, unsigned&);
+      unsigned getAlias(unsigned);
       bool moveRelated(unsigned);
       void decrementDegree(unsigned);
+      void combine(unsigned, unsigned);
+      bool OK(unsigned, unsigned);
+      bool conservative(std::set<unsigned>&);
       void simplify();
       void coalesce();
       void freeze();
@@ -265,11 +274,15 @@ void RASimple::getAllRegs() {
       getUsesDefs(Instr, uses, defs);
       for (unsigned reg: uses) {
         BBRegs[&MBB].first.insert(reg);
-        VirtRegs.insert(reg);
+        if (TRI->isVirtualRegister(reg))
+          VirtRegs.insert(reg);
+        else UsedPhys.insert(reg);
       }
       for (unsigned reg: defs) {
         BBRegs[&MBB].second.insert(reg);
-        VirtRegs.insert(reg);
+        if (TRI->isVirtualRegister(reg))
+          VirtRegs.insert(reg);
+        else UsedPhys.insert(reg);
       }
     }
   }
@@ -325,7 +338,7 @@ void RASimple::getLiveness() {
                      temp.begin(), temp.end(),
                      std::inserter(LiveInRegs[&mbb], LiveInRegs[&mbb].begin()));
 
-      //LiveOutRegs[&mbb].clear();
+      LiveOutRegs[&mbb].clear();
       if (!mbb.succ_empty()) {
         for (MachineBasicBlock::succ_iterator succIt = mbb.succ_begin(); 
                           succIt != mbb.succ_end(); succIt++) {
@@ -360,31 +373,23 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
                             std::set<unsigned>& defs) {
   for (unsigned i = 0; i < Instr.getNumOperands(); i++) {
     MachineOperand& oper = Instr.getOperand(i);
-    if (oper.isReg() && TRI->isVirtualRegister(oper.getReg())) {
+    if (oper.isReg() && oper.getReg() != 0) {
       unsigned Reg = oper.getReg();
       if (oper.isUse()) uses.insert(Reg);
       else if (oper.isDef()) defs.insert(Reg);
     } 
-    else if (oper.isReg())
-      UsedPhys.insert(oper.getReg());
   }
   //implicit use of registers
   if (Instr.getDesc().getImplicitUses())
     for (const uint16_t *regs = Instr.getDesc().getImplicitUses(); 
                                         *regs; regs++) {
-      if (TRI->isVirtualRegister(*regs)) {
-        uses.insert(*regs);
-      }
-      else UsedPhys.insert(*regs);
+      uses.insert(*regs);
     }
   //implicit def of registers
   if (Instr.getDesc().getImplicitDefs())
     for (const uint16_t *regs = Instr.getDesc().getImplicitDefs(); 
                                         *regs; regs++) {
-      if (TRI->isVirtualRegister(*regs)) {
-        defs.insert(*regs);
-      }
-      else UsedPhys.insert(*regs);
+      defs.insert(*regs);
     }
 }
 
@@ -405,6 +410,30 @@ void RASimple::releaseMemory() {
   MoveList.clear();
   WorklistMoves.clear();
   Stack.clear();
+  CoalescedNodes.clear();
+}
+
+std::set<unsigned> RASimple::adjacent(unsigned n) {
+  std::set<unsigned> temp, adj, adjNodes;
+  std::set_union(Stack.begin(), Stack.end(),
+                  CoalescedNodes.begin(), CoalescedNodes.end(),
+                  std::inserter(temp, temp.begin()));
+  adjNodes = InterGraph->getAdj(n);
+  std::set_difference(adjNodes.begin(), adjNodes.end(),
+                      temp.begin(), temp.end(),
+                      std::inserter(adj, adj.begin()));
+  return adj;
+}
+
+void RASimple::addEdge(unsigned u, unsigned v) {
+  if (u != v && !InterGraph->isAdjSet(u, v)) {
+    InterGraph->addSet(u, v);
+    InterGraph->addSet(v, u);
+    if (UsedPhys.find(u) == UsedPhys.end())
+      InterGraph->addEdge(u, v);
+    if (UsedPhys.find(v) == UsedPhys.end())
+      InterGraph->addEdge(v, u);
+  }
 }
 
 void RASimple::buildInterferenceGraph() {
@@ -431,8 +460,9 @@ void RASimple::buildInterferenceGraph() {
         std::set_union(uses.begin(), uses.end(),
                         defs.begin(), defs.end(),
                         std::inserter(UsesDefs, UsesDefs.begin()));
-        for (unsigned n: UsesDefs)
+        for (unsigned n: UsesDefs) {
           MoveList[n].insert(&Instr);
+        }
         WorklistMoves.insert(&Instr);
       }
       temp.clear();
@@ -442,7 +472,7 @@ void RASimple::buildInterferenceGraph() {
       live = temp;
       for (unsigned d: defs) {
         for (unsigned l: live)
-          InterGraph->addEdge(l, d);
+          addEdge(l, d);
       }
       temp.clear();
       std::set_difference(live.begin(), live.end(),
@@ -480,6 +510,7 @@ void RASimple::makeWorklist() {
   }
   std::cout << SpillWorklist.size() << std::endl;
   std::cout << FreezeWorklist.size() << std::endl;
+  std::cout << WorklistMoves.size() << std::endl;
   std::cout << SimplifyWorklist.size() << "\n\n";
 }
 
@@ -515,7 +546,7 @@ void RASimple::decrementDegree(unsigned node) {
   InterGraph->setDegree(node, d - 1);
   unsigned K = getPhysRegs(node).size();
   if (d == K) {
-    std::set<unsigned> temp = InterGraph->getAdj(node);
+    std::set<unsigned> temp = adjacent(node);
     temp.insert(node);
     enableMoves(temp);
     SpillWorklist.erase(node);
@@ -527,17 +558,142 @@ void RASimple::decrementDegree(unsigned node) {
 }
 
 void RASimple::simplify() {
-  std::set<unsigned> temp = SimplifyWorklist;
-  for (unsigned n: temp) {
-    SimplifyWorklist.erase(n);
-    Stack.push_back(n);
-    for (unsigned m: InterGraph->getAdj(n)) {
-      decrementDegree(m);
+  unsigned n = *SimplifyWorklist.begin();
+  SimplifyWorklist.erase(n);
+  Stack.push_back(n);
+  for (unsigned m: adjacent(n)) {
+    decrementDegree(m);
+  }
+}
+
+unsigned RASimple::getAlias(unsigned n) {
+  if (CoalescedNodes.find(n) != CoalescedNodes.end())
+    return getAlias(Alias[n]);
+  else return n;
+}
+
+void RASimple::getMoveReg(MachineInstr* Instr, unsigned& x, unsigned& y) {
+  std::vector<unsigned> regs;
+  for (auto& val: MoveList) {
+    if (val.second.find(Instr) != val.second.end())
+      regs.push_back(val.first);
+  }
+  assert(regs.size() == 2 && "More than two registers on a move!");
+  x = regs[0];
+  y = regs[1];
+}
+
+void RASimple::addWorklist(unsigned u) {
+  unsigned K = getPhysRegs(u).size();
+  if ((UsedPhys.find(u) == UsedPhys.end() && !moveRelated(u))
+        && InterGraph->getDegree(u) < K) {
+    FreezeWorklist.erase(u);
+    SimplifyWorklist.insert(u);
+  }
+}
+
+bool RASimple::OK(unsigned t, unsigned r) {
+  if (UsedPhys.find(t) != UsedPhys.end()) return true;
+  unsigned K = getPhysRegs(t).size();
+  if (InterGraph->getDegree(t) < K) return true;
+  if (InterGraph->isAdjSet(t, r)) return true;
+  return false;
+}
+
+std::string RASimple::getRegClassName(unsigned n) {
+  return std::string(MRI->getRegClass(n)->getName());
+}
+
+bool RASimple::conservative(std::set<unsigned>& nodes) {
+  std::unordered_map<std::string, std::pair<unsigned, unsigned>> RegClass;
+  for (unsigned n: nodes) {
+    unsigned K = getPhysRegs(n).size();
+    if (InterGraph->getDegree(n) >= K) {
+      RegClass[getRegClassName(n)].first = K;
+      RegClass[getRegClassName(n)].second++;
     }
+  }
+  for (auto& reg: RegClass) {
+    if (reg.second.second >= reg.second.first)
+      return false;
+  }
+  return true;
+}
+
+void RASimple::combine(unsigned u, unsigned v) {
+  if (FreezeWorklist.find(v) != FreezeWorklist.end())
+    FreezeWorklist.erase(v);
+  else
+    SpillWorklist.erase(v);
+  CoalescedNodes.insert(v);
+  Alias[v] = u;
+  std::set<MachineInstr*> temp;
+  std::set_union(MoveList[u].begin(), MoveList[u].end(),
+                 MoveList[v].begin(), MoveList[v].end(),
+                 std::inserter(temp, temp.begin()));
+  MoveList[u] = temp;
+  for (unsigned t: adjacent(v)) {
+    addEdge(t, u);
+    decrementDegree(t);
+  }
+  unsigned K = getPhysRegs(u).size();
+  if (InterGraph->getDegree(u) >= K
+      && FreezeWorklist.find(u) != FreezeWorklist.end()) {
+    FreezeWorklist.erase(u);
+    SpillWorklist.insert(u);
   }
 }
 
 void RASimple::coalesce() {
+  MachineInstr* m = *WorklistMoves.begin();
+  unsigned x, y;
+  getMoveReg(m, x, y);
+  x = getAlias(x);
+  y = getAlias(y);
+  std::pair<unsigned, unsigned> pair;
+  if (UsedPhys.find(y) != UsedPhys.end())
+    pair = std::make_pair(y, x);
+  else
+    pair = std::make_pair(x, y);
+  WorklistMoves.erase(m);
+  if (pair.first == pair.second) {
+    CoalescedMoves.insert(m);
+    addWorklist(pair.first);
+    return;
+  } 
+  else if (UsedPhys.find(pair.second) != UsedPhys.end()
+        || InterGraph->isAdjSet(pair.first, pair.second)) {
+    ConstrainedMoves.insert(m);
+    addWorklist(pair.first);
+    addWorklist(pair.second);
+    return;
+  }
+  bool allOK = false;
+  bool isConservative = false;
+  if (UsedPhys.find(pair.first) != UsedPhys.end()) {
+    allOK = true;
+    for (unsigned t: adjacent(pair.second)) {
+      if (!OK(t, pair.first)) {
+        allOK = false;
+        break;
+      }
+    }
+  }
+  else {
+    std::set<unsigned> nodes;
+    std::set_union(adjacent(pair.first).begin(), adjacent(pair.first).end(),
+                   adjacent(pair.second).begin(), adjacent(pair.second).end(),
+                   std::inserter(nodes, nodes.begin()));
+    isConservative = conservative(nodes);
+  }
+  if (allOK || isConservative) {
+    CoalescedMoves.insert(m);
+    combine(pair.first, pair.second);
+    addWorklist(pair.first);
+  }
+  else {
+    ActiveMoves.insert(m);
+  }
 }
 
 void RASimple::freeze() {
