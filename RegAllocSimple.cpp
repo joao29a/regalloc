@@ -19,6 +19,7 @@
 #include <set>
 #include <unordered_map>
 #include <iostream>
+#include <list>
 
 using namespace llvm;
 
@@ -70,6 +71,14 @@ namespace {
       unsigned getDegree(unsigned reg) {
         return Degree[reg];
       }
+
+      std::set<unsigned> getAdj(unsigned u) {
+        return AdjList[u];
+      }
+
+      void setDegree(unsigned reg, unsigned degree) {
+        Degree[reg] = degree;
+      }
   };
 
   class RASimple : public MachineFunctionPass {
@@ -96,11 +105,13 @@ namespace {
     std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveInRegs;
 
     std::unordered_map<unsigned, std::set<MachineInstr*>> MoveList;
-    std::set<MachineInstr*> WorklistMoves;
+    std::set<MachineInstr*> WorklistMoves, ActiveMoves;
+
+    std::list<unsigned> Stack;
 
     Graph* InterGraph;
 
-    std::set<unsigned> spillWorklist, freezeWorklist, simplifyWorklist;
+    std::set<unsigned> SpillWorklist, FreezeWorklist, SimplifyWorklist;
 
     // state
     Spiller *SpillerInstance;
@@ -135,7 +146,8 @@ namespace {
       void buildInterferenceGraph();
       void getAllRegs();
       void getLiveness();
-      void DFS(MachineBasicBlock&, std::vector<MachineBasicBlock*>&, std::set<MachineBasicBlock*>&);
+      void DFS(MachineBasicBlock&, std::vector<MachineBasicBlock*>&, 
+                      std::set<MachineBasicBlock*>&);
       void getSuccessor(MachineBasicBlock&, std::set<MachineBasicBlock*>&,
                         std::set<unsigned>&, std::set<unsigned>&, bool&);
       void getUsesDefs(MachineInstr&, std::set<unsigned>&, std::set<unsigned>&);
@@ -143,6 +155,14 @@ namespace {
       void makeWorklist();
       std::set<uint16_t> getPhysRegs(unsigned);
       void releaseMemory();
+      std::set<MachineInstr*> nodeMoves(unsigned);
+      void enableMoves(std::set<unsigned>&);
+      bool moveRelated(unsigned);
+      void decrementDegree(unsigned);
+      void simplify();
+      void coalesce();
+      void freeze();
+      void selectSpill();
   };
 
   char RASimple::ID = 0;
@@ -371,11 +391,12 @@ void RASimple::releaseMemory() {
   UsedPhys.clear();
   LiveOutRegs.clear();
   LiveInRegs.clear();
-  spillWorklist.clear();
-  freezeWorklist.clear();
-  simplifyWorklist.clear();
+  SpillWorklist.clear();
+  FreezeWorklist.clear();
+  SimplifyWorklist.clear();
   MoveList.clear();
   WorklistMoves.clear();
+  Stack.clear();
 }
 
 void RASimple::buildInterferenceGraph() {
@@ -435,15 +456,77 @@ void RASimple::makeWorklist() {
   for (unsigned VirtReg: InterGraph->getNodes()) {
     unsigned K = getPhysRegs(VirtReg).size();
     if (InterGraph->getDegree(VirtReg) >= K)
-      spillWorklist.insert(VirtReg);
-    else if (MoveList.find(VirtReg) != MoveList.end())
-      freezeWorklist.insert(VirtReg);
+      SpillWorklist.insert(VirtReg);
+    else if (moveRelated(VirtReg))
+      FreezeWorklist.insert(VirtReg);
     else
-      simplifyWorklist.insert(VirtReg);
+      SimplifyWorklist.insert(VirtReg);
   }
   //std::cout << spillWorklist.size() << std::endl;
   //std::cout << freezeWorklist.size() << std::endl;
   //std::cout << simplifyWorklist.size() << "\n\n";
+}
+
+std::set<MachineInstr*> RASimple::nodeMoves(unsigned node) {
+  std::set<MachineInstr*> temp;
+  std::set_union(WorklistMoves.begin(), WorklistMoves.end(),
+                  ActiveMoves.begin(), ActiveMoves.end(),
+                  std::inserter(temp, temp.begin()));
+  std::set_intersection(MoveList[node].begin(), MoveList[node].end(),
+                        temp.begin(), temp.end(),
+                        std::inserter(temp, temp.begin()));
+  return temp;
+}
+
+bool RASimple::moveRelated(unsigned node) {
+  return !nodeMoves(node).empty();
+}
+
+void RASimple::enableMoves(std::set<unsigned>& nodes) {
+  for (unsigned n: nodes) {
+    for (MachineInstr* m: nodeMoves(n)) {
+      if (ActiveMoves.find(m) != ActiveMoves.end()) {
+        ActiveMoves.erase(m);
+        WorklistMoves.insert(m);
+      }
+    }
+  }
+}
+
+void RASimple::decrementDegree(unsigned node) {
+  unsigned d = InterGraph->getDegree(node);
+  InterGraph->setDegree(node, d - 1);
+  unsigned K = getPhysRegs(node).size();
+  if (d == K) {
+    std::set<unsigned> temp = InterGraph->getAdj(node);
+    temp.insert(node);
+    enableMoves(temp);
+    SpillWorklist.erase(node);
+    if (moveRelated(node))
+      FreezeWorklist.insert(node);
+    else
+      SimplifyWorklist.insert(node);
+  }
+}
+
+void RASimple::simplify() {
+  std::set<unsigned> temp = SimplifyWorklist;
+  for (unsigned n: temp) {
+    SimplifyWorklist.erase(n);
+    Stack.push_back(n);
+    for (unsigned m: InterGraph->getAdj(n)) {
+      decrementDegree(m);
+    }
+  }
+}
+
+void RASimple::coalesce() {
+}
+
+void RASimple::freeze() {
+}
+
+void RASimple::selectSpill() {
 }
 
 bool RASimple::runOnMachineFunction(MachineFunction &mf) {
@@ -457,6 +540,14 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
   buildInterferenceGraph();
 
   makeWorklist();
+
+  while (!SimplifyWorklist.empty() || !WorklistMoves.empty()
+          || !FreezeWorklist.empty() || !SpillWorklist.empty()) {
+    if (!SimplifyWorklist.empty()) simplify();
+    else if (!WorklistMoves.empty()) coalesce();
+    else if (!FreezeWorklist.empty()) freeze();
+    else if (!SpillWorklist.empty()) selectSpill();
+  }
 
   SpillerInstance = createInlineSpiller(*this, *this->MF, *this->VRM);
 
