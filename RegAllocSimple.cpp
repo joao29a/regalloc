@@ -99,7 +99,8 @@ namespace {
     typedef std::unordered_map<MachineBasicBlock*, RegsMap>  BBRegsMap;
     BBRegsMap BBRegs;
 
-    std::set<unsigned> UsedPhys;
+
+    std::set<unsigned> UsedPhys, VirtRegs;
 
     std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveOutRegs;
     std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveInRegs;
@@ -262,10 +263,14 @@ void RASimple::getAllRegs() {
     for (MachineInstr& Instr: MBB) {
       std::set<unsigned> uses, defs;
       getUsesDefs(Instr, uses, defs);
-      for (unsigned reg: uses)
+      for (unsigned reg: uses) {
         BBRegs[&MBB].first.insert(reg);
-      for (unsigned reg: defs)
+        VirtRegs.insert(reg);
+      }
+      for (unsigned reg: defs) {
         BBRegs[&MBB].second.insert(reg);
+        VirtRegs.insert(reg);
+      }
     }
   }
 }
@@ -310,7 +315,7 @@ void RASimple::getLiveness() {
     
       std::set<unsigned> temp;
 
-      //LiveInRegs[&mbb].clear();
+      LiveInRegs[&mbb].clear();
 
       std::set_difference(LiveOutRegs[&mbb].begin(), LiveOutRegs[&mbb].end(),
                           BBRegs[&mbb].second.begin(), BBRegs[&mbb].second.end(),
@@ -367,16 +372,18 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
   if (Instr.getDesc().getImplicitUses())
     for (const uint16_t *regs = Instr.getDesc().getImplicitUses(); 
                                         *regs; regs++) {
-      if (TRI->isVirtualRegister(*regs))
+      if (TRI->isVirtualRegister(*regs)) {
         uses.insert(*regs);
+      }
       else UsedPhys.insert(*regs);
     }
   //implicit def of registers
   if (Instr.getDesc().getImplicitDefs())
     for (const uint16_t *regs = Instr.getDesc().getImplicitDefs(); 
                                         *regs; regs++) {
-      if (TRI->isVirtualRegister(*regs))
+      if (TRI->isVirtualRegister(*regs)) {
         defs.insert(*regs);
+      }
       else UsedPhys.insert(*regs);
     }
 }
@@ -389,6 +396,7 @@ bool RASimple::isMoveInstr(MachineInstr& Instr) {
 void RASimple::releaseMemory() {
   BBRegs.clear();
   UsedPhys.clear();
+  VirtRegs.clear();
   LiveOutRegs.clear();
   LiveInRegs.clear();
   SpillWorklist.clear();
@@ -409,12 +417,15 @@ void RASimple::buildInterferenceGraph() {
     for (MachineBasicBlock::reverse_instr_iterator instrIt = MBB.instr_rbegin();
               instrIt != MBB.instr_rend(); instrIt++) {
       MachineInstr& Instr = *instrIt;
-      std::set<unsigned> uses, defs;
+      std::set<unsigned> uses, defs, temp;
       getUsesDefs(Instr, uses, defs);
       if (isMoveInstr(Instr)) {
+        temp.clear();
         std::set_difference(live.begin(), live.end(),
                             uses.begin(), uses.end(),
-                            std::inserter(live, live.begin()));
+                            std::inserter(temp, temp.begin()));
+
+        live = temp;
         
         std::set<unsigned> UsesDefs;
         std::set_union(uses.begin(), uses.end(),
@@ -424,17 +435,20 @@ void RASimple::buildInterferenceGraph() {
           MoveList[n].insert(&Instr);
         WorklistMoves.insert(&Instr);
       }
+      temp.clear();
       std::set_union(live.begin(), live.end(),
                       defs.begin(), defs.end(),
-                      std::inserter(live, live.begin()));
+                      std::inserter(temp, temp.begin()));
+      live = temp;
       for (unsigned d: defs) {
         for (unsigned l: live)
           InterGraph->addEdge(l, d);
       }
-      std::set<unsigned> temp;
+      temp.clear();
       std::set_difference(live.begin(), live.end(),
                           defs.begin(), defs.end(),
                           std::inserter(temp, temp.begin()));
+      live.clear();
       std::set_union(temp.begin(), temp.end(),
                       uses.begin(), uses.end(),
                       std::inserter(live, live.begin()));
@@ -453,7 +467,9 @@ std::set<uint16_t> RASimple::getPhysRegs(unsigned VirtReg) {
 }
 
 void RASimple::makeWorklist() {
-  for (unsigned VirtReg: InterGraph->getNodes()) {
+  std::set<unsigned> initial = VirtRegs;
+  for (unsigned VirtReg: initial) {
+    VirtRegs.erase(VirtReg);
     unsigned K = getPhysRegs(VirtReg).size();
     if (InterGraph->getDegree(VirtReg) >= K)
       SpillWorklist.insert(VirtReg);
@@ -462,9 +478,9 @@ void RASimple::makeWorklist() {
     else
       SimplifyWorklist.insert(VirtReg);
   }
-  //std::cout << spillWorklist.size() << std::endl;
-  //std::cout << freezeWorklist.size() << std::endl;
-  //std::cout << simplifyWorklist.size() << "\n\n";
+  std::cout << SpillWorklist.size() << std::endl;
+  std::cout << FreezeWorklist.size() << std::endl;
+  std::cout << SimplifyWorklist.size() << "\n\n";
 }
 
 std::set<MachineInstr*> RASimple::nodeMoves(unsigned node) {
@@ -472,10 +488,11 @@ std::set<MachineInstr*> RASimple::nodeMoves(unsigned node) {
   std::set_union(WorklistMoves.begin(), WorklistMoves.end(),
                   ActiveMoves.begin(), ActiveMoves.end(),
                   std::inserter(temp, temp.begin()));
+  std::set<MachineInstr*> tempUnion;
   std::set_intersection(MoveList[node].begin(), MoveList[node].end(),
                         temp.begin(), temp.end(),
-                        std::inserter(temp, temp.begin()));
-  return temp;
+                        std::inserter(tempUnion, tempUnion.begin()));
+  return tempUnion;
 }
 
 bool RASimple::moveRelated(unsigned node) {
