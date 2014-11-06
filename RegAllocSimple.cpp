@@ -37,6 +37,7 @@ namespace {
     private:
       std::unordered_map<unsigned, std::set<unsigned>> AdjList;
       std::unordered_map<unsigned, unsigned> Degree;
+      std::unordered_map<unsigned, unsigned> Color;
       std::set<std::pair<unsigned, unsigned>> AdjSet;
       std::set<unsigned> Nodes;
     
@@ -75,6 +76,14 @@ namespace {
       void setDegree(unsigned reg, unsigned degree) {
         Degree[reg] = degree;
       }
+
+      void setColor(unsigned reg, unsigned color) {
+        Color[reg] = color;
+      }
+
+      unsigned getColor(unsigned reg) {
+        return Color[reg];
+      }
   };
 
   class RASimple : public MachineFunctionPass {
@@ -112,7 +121,7 @@ namespace {
     Graph* InterGraph;
 
     std::set<unsigned> SpillWorklist, FreezeWorklist, SimplifyWorklist,
-          CoalescedNodes;
+          CoalescedNodes, ColoredNodes, SpilledNodes;
 
     // state
     Spiller *SpillerInstance;
@@ -172,6 +181,7 @@ namespace {
       void coalesce();
       void freeze();
       void selectSpill();
+      void assignColors();
   };
 
   char RASimple::ID = 0;
@@ -374,6 +384,8 @@ void RASimple::releaseMemory() {
   ConstrainedMoves.clear();
   Stack.clear();
   CoalescedNodes.clear();
+  ColoredNodes.clear();
+  SpilledNodes.clear();
   Alias.clear();
 }
 
@@ -450,12 +462,10 @@ void RASimple::buildInterferenceGraph() {
 }
 
 std::set<uint16_t> RASimple::getPhysRegs(unsigned VirtReg) {
-  AllocationOrder Order(VirtReg, *VRM, RegClassInfo);
+  ArrayRef<uint16_t> regs = RegClassInfo.getOrder(MRI->getRegClass(VirtReg));
   std::set<uint16_t> AvailablePhys;
-  while (uint16_t reg = Order.next()) {
-    if (UsedPhys.find(reg) == UsedPhys.end())
-      AvailablePhys.insert(reg);
-  }
+  for (size_t i = 0; i < regs.size(); i++)
+      AvailablePhys.insert(regs[i]);
   return AvailablePhys;
 }
 
@@ -705,6 +715,33 @@ void RASimple::selectSpill() {
   freezeMoves(m);
 }
 
+void RASimple::assignColors() {
+  while (!Stack.empty()) {
+    unsigned n = Stack.back();
+    Stack.pop_back();
+    std::set<uint16_t> okColors = getPhysRegs(n);
+    for (unsigned w: InterGraph->getAdj(n)) {
+      std::set<unsigned> temp;
+      std::set_union(ColoredNodes.begin(), ColoredNodes.end(),
+                      UsedPhys.begin(), UsedPhys.end(),
+                      std::inserter(temp, temp.begin()));
+      if (temp.find(getAlias(w)) != temp.end()) {
+        okColors.erase(InterGraph->getColor(getAlias(w)));
+      }
+    }
+    if (okColors.empty()) {
+      SpilledNodes.insert(n);
+    }
+    else {
+      ColoredNodes.insert(n);
+      unsigned c = *okColors.begin();
+      InterGraph->setColor(n, c);
+    }
+  }
+  for (unsigned n: CoalescedNodes)
+    InterGraph->setColor(n, InterGraph->getColor(getAlias(n)));
+}
+
 bool RASimple::runOnMachineFunction(MachineFunction &mf) {
   DEBUG(dbgs() << "********** SIMPLE REGISTER ALLOCATION **********\n"
       << "********** Function: "  << mf.getName() << '\n');
@@ -724,6 +761,8 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
     else if (!FreezeWorklist.empty()) freeze();
     else if (!SpillWorklist.empty()) selectSpill();
   }
+
+  assignColors();
 
   SpillerInstance = createInlineSpiller(*this, *this->MF, *this->VRM);
 
