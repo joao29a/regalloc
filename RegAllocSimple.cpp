@@ -167,6 +167,7 @@ namespace {
       void combine(unsigned, unsigned);
       bool OK(unsigned, unsigned);
       bool conservative(std::set<unsigned>&);
+      void freezeMoves(unsigned);
       void simplify();
       void coalesce();
       void freeze();
@@ -374,7 +375,6 @@ void RASimple::releaseMemory() {
   Stack.clear();
   CoalescedNodes.clear();
   Alias.clear();
-  delete InterGraph;
 }
 
 std::set<unsigned> RASimple::adjacent(unsigned n) {
@@ -671,10 +671,38 @@ void RASimple::coalesce() {
   }
 }
 
+void RASimple::freezeMoves(unsigned u) {
+  for (MachineInstr* m: nodeMoves(u)) {
+    unsigned x, y, v;
+    getMoveReg(m, x, y);
+    if (getAlias(y) == getAlias(u))
+      v = getAlias(x);
+    else
+      v = getAlias(y);
+    ActiveMoves.erase(m);
+    if (nodeMoves(v).empty() && TRI->isVirtualRegister(v)) {
+      unsigned K = getPhysRegs(v).size();
+      if (InterGraph->getDegree(v) < K) {
+        FreezeWorklist.erase(v);
+        SimplifyWorklist.insert(v);
+      }
+    }
+  }
+}
+
 void RASimple::freeze() {
+  unsigned u = *FreezeWorklist.begin();
+  FreezeWorklist.erase(u);
+  SimplifyWorklist.insert(u);
+  freezeMoves(u);
 }
 
 void RASimple::selectSpill() {
+  //TODO -> implement heuristic to get a node.
+  unsigned m = *SpillWorklist.begin();
+  SpillWorklist.erase(m);
+  SimplifyWorklist.insert(m);
+  freezeMoves(m);
 }
 
 bool RASimple::runOnMachineFunction(MachineFunction &mf) {
