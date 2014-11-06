@@ -1,21 +1,27 @@
 #include "../../CodeGen/AllocationOrder.h"
+#include "../../CodeGen/LiveDebugVariables.h"
 #include "../../CodeGen/Spiller.h"
+#include "llvm/CodeGen/Passes.h"
 #include "llvm/Analysis/AliasAnalysis.h"
-#include "llvm/CodeGen/RegisterClassInfo.h"
+#include "llvm/CodeGen/CalcSpillWeights.h"
 #include "llvm/CodeGen/LiveIntervalAnalysis.h"
 #include "llvm/CodeGen/LiveRangeEdit.h"
 #include "llvm/CodeGen/LiveRegMatrix.h"
 #include "llvm/CodeGen/LiveStackAnalysis.h"
-#include "llvm/CodeGen/MachineFunctionPass.h"
-#include "llvm/CodeGen/MachineRegisterInfo.h"
-#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/PassAnalysisSupport.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetRegisterInfo.h"
+#include "llvm/CodeGen/LiveInterval.h"
+#include "llvm/CodeGen/RegisterClassInfo.h"
 #include <set>
 #include <unordered_map>
 #include <iostream>
@@ -40,7 +46,7 @@ namespace {
       std::unordered_map<unsigned, unsigned> Color;
       std::set<std::pair<unsigned, unsigned>> AdjSet;
       std::set<unsigned> Nodes;
-    
+
     public:
       Graph() {};
 
@@ -56,9 +62,9 @@ namespace {
       }
 
       void addEdge(unsigned u , unsigned v) {
-          AdjList[u].insert(v);
-          Degree[u] += 1;
-          Nodes.insert(u);
+        AdjList[u].insert(v);
+        Degree[u] += 1;
+        Nodes.insert(u);
       }
 
       std::set<unsigned>& getNodes() {
@@ -121,7 +127,7 @@ namespace {
     Graph* InterGraph;
 
     std::set<unsigned> SpillWorklist, FreezeWorklist, SimplifyWorklist,
-          CoalescedNodes, ColoredNodes, SpilledNodes;
+      CoalescedNodes, ColoredNodes, SpilledNodes;
 
     // state
     Spiller *SpillerInstance;
@@ -157,7 +163,7 @@ namespace {
       void getAllRegs();
       void getLiveness();
       void getSuccessor(MachineBasicBlock&, std::set<MachineBasicBlock*>&,
-                        std::set<unsigned>&, std::set<unsigned>&, bool&);
+          std::set<unsigned>&, std::set<unsigned>&, bool&);
       void getUsesDefs(MachineInstr&, std::set<unsigned>&, std::set<unsigned>&);
       bool isMoveInstr(MachineInstr&);
       void makeWorklist();
@@ -189,32 +195,42 @@ namespace {
 }
 
 RASimple::RASimple(): MachineFunctionPass(ID) {
+  initializeLiveDebugVariablesPass(*PassRegistry::getPassRegistry());
   initializeLiveIntervalsPass(*PassRegistry::getPassRegistry());
+  initializeSlotIndexesPass(*PassRegistry::getPassRegistry());
+  initializeRegisterCoalescerPass(*PassRegistry::getPassRegistry());
+  initializeMachineSchedulerPass(*PassRegistry::getPassRegistry());
+  initializeLiveStacksPass(*PassRegistry::getPassRegistry());
+  initializeMachineDominatorTreePass(*PassRegistry::getPassRegistry());
+  initializeMachineLoopInfoPass(*PassRegistry::getPassRegistry());
   initializeVirtRegMapPass(*PassRegistry::getPassRegistry());
   initializeLiveRegMatrixPass(*PassRegistry::getPassRegistry());
-  initializeLiveStacksPass(*PassRegistry::getPassRegistry());
-  initializeMachineLoopInfoPass(*PassRegistry::getPassRegistry());
-  initializeMachineBlockFrequencyInfoPass(*PassRegistry::getPassRegistry());
+
 }
 
 void RASimple::getAnalysisUsage(AnalysisUsage &AU) const {
+  AU.setPreservesCFG();
   AU.addRequired<AliasAnalysis>();
   AU.addPreserved<AliasAnalysis>();
   AU.addRequired<LiveIntervals>();
   AU.addPreserved<LiveIntervals>();
-  AU.addRequired<VirtRegMap>();
-  AU.addPreserved<VirtRegMap>();
-  AU.addRequired<LiveRegMatrix>();
-  AU.addPreserved<LiveRegMatrix>();
+  AU.addPreserved<SlotIndexes>();
+  AU.addRequired<LiveDebugVariables>();
+  AU.addPreserved<LiveDebugVariables>();
   AU.addRequired<LiveStacks>();
-  AU.addPreserved<LiveStacks>();  
-  AU.addRequired<MachineLoopInfo>();
-  AU.addPreserved<MachineLoopInfo>();
+  AU.addPreserved<LiveStacks>();
   AU.addRequired<MachineBlockFrequencyInfo>();
   AU.addPreserved<MachineBlockFrequencyInfo>();
   AU.addRequiredID(MachineDominatorsID);
   AU.addPreservedID(MachineDominatorsID);
+  AU.addRequired<MachineLoopInfo>();
+  AU.addPreserved<MachineLoopInfo>();
+  AU.addRequired<VirtRegMap>();
+  AU.addPreserved<VirtRegMap>();
+  AU.addRequired<LiveRegMatrix>();
+  AU.addPreserved<LiveRegMatrix>();
   MachineFunctionPass::getAnalysisUsage(AU);
+
 }
 void RASimple::init(MachineFunction &MF) {
   this->MF  = &MF;
@@ -223,6 +239,8 @@ void RASimple::init(MachineFunction &MF) {
   this->TII = this->TM->getInstrInfo();
   this->TRI = this->TM->getRegisterInfo();
   this->VRM = &getAnalysis<VirtRegMap>();
+  this->LIS = &getAnalysis<LiveIntervals>();
+  this->Matrix = &getAnalysis<LiveRegMatrix>();
   RegClassInfo.runOnMachineFunction(VRM->getMachineFunction());
 }
 
@@ -244,8 +262,10 @@ void RASimple::allocatePhysRegs() {
 
       unsigned AvailablePhysReg = selectOrSpill(*VirtReg);
 
-      if (AvailablePhysReg)
+      if (AvailablePhysReg) {
+        std::cout << VirtReg->reg << " -- " << AvailablePhysReg << " oi\n";
         Matrix->assign(*VirtReg, AvailablePhysReg);
+      }
     }
   }
 }
@@ -297,33 +317,33 @@ void RASimple::getAllRegs() {
 
 void RASimple::getLiveness() {
   std::set<unsigned> oldIn, oldOut;
-  
+
   bool finished = false;
   while (!finished) {
     finished = true;
     for (MachineBasicBlock& mbb: *MF) {
       oldIn  = LiveInRegs[&mbb];
       oldOut = LiveOutRegs[&mbb];
-    
+
       std::set<unsigned> temp;
 
       LiveInRegs[&mbb].clear();
 
       std::set_difference(LiveOutRegs[&mbb].begin(), LiveOutRegs[&mbb].end(),
-                          BBRegs[&mbb].second.begin(), BBRegs[&mbb].second.end(),
-                          std::inserter(temp, temp.begin()));
+          BBRegs[&mbb].second.begin(), BBRegs[&mbb].second.end(),
+          std::inserter(temp, temp.begin()));
 
       std::set_union(BBRegs[&mbb].first.begin(), BBRegs[&mbb].first.end(),
-                     temp.begin(), temp.end(),
-                     std::inserter(LiveInRegs[&mbb], LiveInRegs[&mbb].begin()));
+          temp.begin(), temp.end(),
+          std::inserter(LiveInRegs[&mbb], LiveInRegs[&mbb].begin()));
 
       LiveOutRegs[&mbb].clear();
       if (!mbb.succ_empty()) {
         for (MachineBasicBlock::succ_iterator succIt = mbb.succ_begin(); 
-                          succIt != mbb.succ_end(); succIt++) {
+            succIt != mbb.succ_end(); succIt++) {
           MachineBasicBlock *mbbSucc = *succIt;
           std::copy(LiveInRegs[mbbSucc].begin(), LiveInRegs[mbbSucc].end(),
-                    std::inserter(LiveOutRegs[&mbb], LiveOutRegs[&mbb].begin()));
+              std::inserter(LiveOutRegs[&mbb], LiveOutRegs[&mbb].begin()));
         }
       }
 
@@ -334,15 +354,13 @@ void RASimple::getLiveness() {
 }
 
 void RASimple::livenessAnalysis() {
-  this->LIS = &getAnalysis<LiveIntervals>();
-  this->Matrix = &getAnalysis<LiveRegMatrix>();
   getAllRegs();
   getLiveness();
 }
 
 
 void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
-                            std::set<unsigned>& defs) {
+    std::set<unsigned>& defs) {
   for (unsigned i = 0; i < Instr.getNumOperands(); i++) {
     MachineOperand& oper = Instr.getOperand(i);
     if (oper.isReg() && oper.getReg() != 0) {
@@ -354,13 +372,13 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
   //implicit use of registers
   if (Instr.getDesc().getImplicitUses())
     for (const uint16_t *regs = Instr.getDesc().getImplicitUses(); 
-                                        *regs; regs++) {
+        *regs; regs++) {
       uses.insert(*regs);
     }
   //implicit def of registers
   if (Instr.getDesc().getImplicitDefs())
     for (const uint16_t *regs = Instr.getDesc().getImplicitDefs(); 
-                                        *regs; regs++) {
+        *regs; regs++) {
       defs.insert(*regs);
     }
 }
@@ -392,12 +410,12 @@ void RASimple::releaseMemory() {
 std::set<unsigned> RASimple::adjacent(unsigned n) {
   std::set<unsigned> temp, adj, adjNodes;
   std::set_union(Stack.begin(), Stack.end(),
-                  CoalescedNodes.begin(), CoalescedNodes.end(),
-                  std::inserter(temp, temp.begin()));
+      CoalescedNodes.begin(), CoalescedNodes.end(),
+      std::inserter(temp, temp.begin()));
   adjNodes = InterGraph->getAdj(n);
   std::set_difference(adjNodes.begin(), adjNodes.end(),
-                      temp.begin(), temp.end(),
-                      std::inserter(adj, adj.begin()));
+      temp.begin(), temp.end(),
+      std::inserter(adj, adj.begin()));
   return adj;
 }
 
@@ -413,28 +431,28 @@ void RASimple::addEdge(unsigned u, unsigned v) {
 }
 
 void RASimple::buildInterferenceGraph() {
-  
+
   InterGraph = new Graph();
 
   for (MachineBasicBlock& MBB: *MF) {
     std::set<unsigned> live = LiveOutRegs[&MBB];
     for (MachineBasicBlock::reverse_instr_iterator instrIt = MBB.instr_rbegin();
-              instrIt != MBB.instr_rend(); instrIt++) {
+        instrIt != MBB.instr_rend(); instrIt++) {
       MachineInstr& Instr = *instrIt;
       std::set<unsigned> uses, defs, temp;
       getUsesDefs(Instr, uses, defs);
       if (isMoveInstr(Instr)) {
         temp.clear();
         std::set_difference(live.begin(), live.end(),
-                            uses.begin(), uses.end(),
-                            std::inserter(temp, temp.begin()));
+            uses.begin(), uses.end(),
+            std::inserter(temp, temp.begin()));
 
         live = temp;
-        
+
         std::set<unsigned> UsesDefs;
         std::set_union(uses.begin(), uses.end(),
-                        defs.begin(), defs.end(),
-                        std::inserter(UsesDefs, UsesDefs.begin()));
+            defs.begin(), defs.end(),
+            std::inserter(UsesDefs, UsesDefs.begin()));
         for (unsigned n: UsesDefs) {
           MoveList[n].insert(&Instr);
         }
@@ -442,8 +460,8 @@ void RASimple::buildInterferenceGraph() {
       }
       temp.clear();
       std::set_union(live.begin(), live.end(),
-                      defs.begin(), defs.end(),
-                      std::inserter(temp, temp.begin()));
+          defs.begin(), defs.end(),
+          std::inserter(temp, temp.begin()));
       live = temp;
       for (unsigned d: defs) {
         for (unsigned l: live)
@@ -451,12 +469,12 @@ void RASimple::buildInterferenceGraph() {
       }
       temp.clear();
       std::set_difference(live.begin(), live.end(),
-                          defs.begin(), defs.end(),
-                          std::inserter(temp, temp.begin()));
+          defs.begin(), defs.end(),
+          std::inserter(temp, temp.begin()));
       live.clear();
       std::set_union(temp.begin(), temp.end(),
-                      uses.begin(), uses.end(),
-                      std::inserter(live, live.begin()));
+          uses.begin(), uses.end(),
+          std::inserter(live, live.begin()));
     }
   }
 }
@@ -465,7 +483,7 @@ std::set<uint16_t> RASimple::getPhysRegs(unsigned VirtReg) {
   ArrayRef<uint16_t> regs = RegClassInfo.getOrder(MRI->getRegClass(VirtReg));
   std::set<uint16_t> AvailablePhys;
   for (size_t i = 0; i < regs.size(); i++)
-      AvailablePhys.insert(regs[i]);
+    AvailablePhys.insert(regs[i]);
   return AvailablePhys;
 }
 
@@ -490,12 +508,12 @@ void RASimple::makeWorklist() {
 std::set<MachineInstr*> RASimple::nodeMoves(unsigned node) {
   std::set<MachineInstr*> temp;
   std::set_union(WorklistMoves.begin(), WorklistMoves.end(),
-                  ActiveMoves.begin(), ActiveMoves.end(),
-                  std::inserter(temp, temp.begin()));
+      ActiveMoves.begin(), ActiveMoves.end(),
+      std::inserter(temp, temp.begin()));
   std::set<MachineInstr*> tempUnion;
   std::set_intersection(MoveList[node].begin(), MoveList[node].end(),
-                        temp.begin(), temp.end(),
-                        std::inserter(tempUnion, tempUnion.begin()));
+      temp.begin(), temp.end(),
+      std::inserter(tempUnion, tempUnion.begin()));
   return tempUnion;
 }
 
@@ -608,8 +626,9 @@ bool RASimple::conservative(std::set<unsigned>& nodes) {
 }
 
 void RASimple::combine(unsigned u, unsigned v) {
-  if (FreezeWorklist.find(v) != FreezeWorklist.end())
+  if (FreezeWorklist.find(v) != FreezeWorklist.end()) {
     FreezeWorklist.erase(v);
+  }
   else
     SpillWorklist.erase(v);
   CoalescedNodes.insert(v);
@@ -646,7 +665,7 @@ void RASimple::coalesce() {
     return;
   } 
   else if (UsedPhys.find(pair.second) != UsedPhys.end()
-        || InterGraph->isAdjSet(pair.first, pair.second)) {
+      || InterGraph->isAdjSet(pair.first, pair.second)) {
     ConstrainedMoves.insert(m);
     addWorklist(pair.first);
     addWorklist(pair.second);
@@ -667,8 +686,8 @@ void RASimple::coalesce() {
     adjU = adjacent(pair.first);
     adjV = adjacent(pair.second);
     std::set_union(adjU.begin(), adjU.end(),
-                   adjV.begin(), adjV.end(),
-                   std::inserter(nodes, nodes.begin()));
+        adjV.begin(), adjV.end(),
+        std::inserter(nodes, nodes.begin()));
     isConservative = conservative(nodes);
   }
   if (allOK || isConservative) {
@@ -716,6 +735,7 @@ void RASimple::selectSpill() {
 }
 
 void RASimple::assignColors() {
+  std::cout << Stack.size() << std::endl;
   while (!Stack.empty()) {
     unsigned n = Stack.back();
     Stack.pop_back();
@@ -723,8 +743,8 @@ void RASimple::assignColors() {
     for (unsigned w: InterGraph->getAdj(n)) {
       std::set<unsigned> temp;
       std::set_union(ColoredNodes.begin(), ColoredNodes.end(),
-                      UsedPhys.begin(), UsedPhys.end(),
-                      std::inserter(temp, temp.begin()));
+          UsedPhys.begin(), UsedPhys.end(),
+          std::inserter(temp, temp.begin()));
       if (temp.find(getAlias(w)) != temp.end()) {
         okColors.erase(InterGraph->getColor(getAlias(w)));
       }
@@ -738,14 +758,15 @@ void RASimple::assignColors() {
       InterGraph->setColor(n, c);
     }
   }
-  for (unsigned n: CoalescedNodes)
+  for (unsigned n: CoalescedNodes) {
     InterGraph->setColor(n, InterGraph->getColor(getAlias(n)));
+  }
 }
 
 bool RASimple::runOnMachineFunction(MachineFunction &mf) {
   DEBUG(dbgs() << "********** SIMPLE REGISTER ALLOCATION **********\n"
       << "********** Function: "  << mf.getName() << '\n');
-  
+
   init(mf);
 
   livenessAnalysis();
@@ -755,7 +776,7 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
   makeWorklist();
 
   while (!SimplifyWorklist.empty() || !WorklistMoves.empty()
-          || !FreezeWorklist.empty() || !SpillWorklist.empty()) {
+      || !FreezeWorklist.empty() || !SpillWorklist.empty()) {
     if (!SimplifyWorklist.empty()) simplify();
     else if (!WorklistMoves.empty()) coalesce();
     else if (!FreezeWorklist.empty()) freeze();
@@ -766,7 +787,31 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
 
   SpillerInstance = createInlineSpiller(*this, *this->MF, *this->VRM);
 
-  allocatePhysRegs();
+  //VRM->clearAllVirt();
+
+  for (unsigned n: InterGraph->getNodes()) {
+    std::cout << n << ": " << InterGraph->getColor(n) << std::endl;
+    if (InterGraph->getColor(n) != 0) {
+      VRM->assignVirt2Phys(n, InterGraph->getColor(n));
+    }
+    else if (SpilledNodes.find(n) == SpilledNodes.end()) {
+      for (MachineInstr* instr: MoveList[n])
+        instr->eraseFromParent();
+      //LiveInterval* VirtReg = &LIS->getInterval(n);
+      //SmallVector<unsigned, 4> VirtVet;
+      //LiveRangeEdit LRE(VirtReg, VirtVet, *MF, *LIS, VRM);
+      //SpillerInstance->spill(LRE);
+    }
+  }
+  while (!SpilledNodes.empty()) {
+    unsigned n = *SpilledNodes.begin();
+    LiveInterval* VirtReg = &LIS->getInterval(n);
+    SmallVector<unsigned, 1> VirtVet;
+    LiveRangeEdit LRE(VirtReg, VirtVet, *MF, *LIS, VRM);
+    SpillerInstance->spill(LRE);
+  }
+
+  //allocatePhysRegs();
 
   delete SpillerInstance;
 
