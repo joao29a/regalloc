@@ -118,37 +118,35 @@ namespace {
     Spiller *SpillerInstance;
 
     public:
-    RASimple();
+      RASimple();
 
-    /// Return the pass name.
-    const char* getPassName() const override {
-      return "Simple Register Allocator";
-    }
+      /// Return the pass name.
+      const char* getPassName() const override {
+        return "Simple Register Allocator";
+      }
 
-    // A RegAlloc pass should call this before allocatePhysRegs.
-    void init(MachineFunction &MF);
+      // A RegAlloc pass should call this before allocatePhysRegs.
+      void init(MachineFunction &MF);
 
-    // The top-level driver. The output is a VirtRegMap that us updated with
-    // physical register assignments.
-    void allocatePhysRegs();
+      // The top-level driver. The output is a VirtRegMap that us updated with
+      // physical register assignments.
+      void allocatePhysRegs();
 
-    /// RASimple analysis usage.
-    void getAnalysisUsage(AnalysisUsage &AU) const override;
+      /// RASimple analysis usage.
+      void getAnalysisUsage(AnalysisUsage &AU) const override;
 
-    unsigned selectOrSpill(LiveInterval &VirtReg);
+      unsigned selectOrSpill(LiveInterval &VirtReg);
 
-    /// Perform register allocation.
-    bool runOnMachineFunction(MachineFunction &mf) override;
+      /// Perform register allocation.
+      bool runOnMachineFunction(MachineFunction &mf) override;
 
-    static char ID;
+      static char ID;
 
     private:
       void livenessAnalysis();
       void buildInterferenceGraph();
       void getAllRegs();
       void getLiveness();
-      void DFS(MachineBasicBlock&, std::vector<MachineBasicBlock*>&, 
-                      std::set<MachineBasicBlock*>&);
       void getSuccessor(MachineBasicBlock&, std::set<MachineBasicBlock*>&,
                         std::set<unsigned>&, std::set<unsigned>&, bool&);
       void getUsesDefs(MachineInstr&, std::set<unsigned>&, std::set<unsigned>&);
@@ -214,8 +212,6 @@ void RASimple::init(MachineFunction &MF) {
   this->TII = this->TM->getInstrInfo();
   this->TRI = this->TM->getRegisterInfo();
   this->VRM = &getAnalysis<VirtRegMap>();
-
-
   RegClassInfo.runOnMachineFunction(VRM->getMachineFunction());
 }
 
@@ -288,41 +284,13 @@ void RASimple::getAllRegs() {
   }
 }
 
-void RASimple::DFS(MachineBasicBlock& MBB, 
-                   std::vector<MachineBasicBlock*>& mbbOrder,
-                   std::set<MachineBasicBlock*>& visited) {
-  if (visited.find(&MBB) == visited.end()){
-    visited.insert(&MBB);
-    mbbOrder.push_back(&MBB);
-    if (!MBB.succ_empty()){
-      for (MachineBasicBlock::succ_iterator succIt = MBB.succ_begin();
-              succIt != MBB.succ_end(); succIt++) {
-        MachineBasicBlock* succ = *succIt;
-        DFS(*succ, mbbOrder, visited);
-      }
-    } 
-  }
-}
-
 void RASimple::getLiveness() {
-  //std::vector<MachineBasicBlock*> mbbOrder;
-  //std::set<MachineBasicBlock*> visited;
- 
-  //for (MachineBasicBlock& MBB: *MF) {
-  //  DFS(MBB, mbbOrder, visited);
-  //}
-
   std::set<unsigned> oldIn, oldOut;
   
   bool finished = false;
   while (!finished) {
     finished = true;
     for (MachineBasicBlock& mbb: *MF) {
-    //for (std::vector<MachineBasicBlock*>::reverse_iterator 
-    //          mbbIt = mbbOrder.rbegin(); mbbIt != mbbOrder.rend(); mbbIt++) {
-
-      //MachineBasicBlock *mbb = *mbbIt;
-
       oldIn  = LiveInRegs[&mbb];
       oldOut = LiveOutRegs[&mbb];
     
@@ -352,13 +320,6 @@ void RASimple::getLiveness() {
         finished = false;
     }
   }
-  //for (auto& t: LiveOutRegs){
-  //  std::cout << t.first << ": ";
-  //  for (auto& a: t.second){
-  //    std::cout << a << " ";
-  //  }
-  //  std::cout << "\n\n";
-  //}
 }
 
 void RASimple::livenessAnalysis() {
@@ -394,8 +355,7 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
 }
 
 bool RASimple::isMoveInstr(MachineInstr& Instr) {
-  if (Instr.isCopyLike()) return true;
-  return false;
+  return Instr.isCopyLike();
 }
 
 void RASimple::releaseMemory() {
@@ -409,8 +369,12 @@ void RASimple::releaseMemory() {
   SimplifyWorklist.clear();
   MoveList.clear();
   WorklistMoves.clear();
+  CoalescedMoves.clear();
+  ConstrainedMoves.clear();
   Stack.clear();
   CoalescedNodes.clear();
+  Alias.clear();
+  delete InterGraph;
 }
 
 std::set<unsigned> RASimple::adjacent(unsigned n) {
@@ -437,7 +401,6 @@ void RASimple::addEdge(unsigned u, unsigned v) {
 }
 
 void RASimple::buildInterferenceGraph() {
-  if (InterGraph != nullptr) delete InterGraph;
   
   InterGraph = new Graph();
 
@@ -542,8 +505,10 @@ void RASimple::enableMoves(std::set<unsigned>& nodes) {
 }
 
 void RASimple::decrementDegree(unsigned node) {
+  if (UsedPhys.find(node) != UsedPhys.end()) return;
   unsigned d = InterGraph->getDegree(node);
   InterGraph->setDegree(node, d - 1);
+  assert(TRI->isVirtualRegister(node) && "not virtual!");
   unsigned K = getPhysRegs(node).size();
   if (d == K) {
     std::set<unsigned> temp = adjacent(node);
@@ -584,16 +549,18 @@ void RASimple::getMoveReg(MachineInstr* Instr, unsigned& x, unsigned& y) {
 }
 
 void RASimple::addWorklist(unsigned u) {
-  unsigned K = getPhysRegs(u).size();
-  if ((UsedPhys.find(u) == UsedPhys.end() && !moveRelated(u))
-        && InterGraph->getDegree(u) < K) {
-    FreezeWorklist.erase(u);
-    SimplifyWorklist.insert(u);
+  if (UsedPhys.find(u) == UsedPhys.end()) {
+    unsigned K = getPhysRegs(u).size();
+    if (!moveRelated(u) && InterGraph->getDegree(u) < K) {
+      FreezeWorklist.erase(u);
+      SimplifyWorklist.insert(u);
+    }
   }
 }
 
 bool RASimple::OK(unsigned t, unsigned r) {
   if (UsedPhys.find(t) != UsedPhys.end()) return true;
+  assert(TRI->isVirtualRegister(t) && "not virtual!");
   unsigned K = getPhysRegs(t).size();
   if (InterGraph->getDegree(t) < K) return true;
   if (InterGraph->isAdjSet(t, r)) return true;
@@ -601,21 +568,31 @@ bool RASimple::OK(unsigned t, unsigned r) {
 }
 
 std::string RASimple::getRegClassName(unsigned n) {
+  if (UsedPhys.find(n) != UsedPhys.end()) {
+    for (unsigned i = 0; i < TRI->getNumRegClasses(); i++) {
+      if (TRI->getRegClass(i)->contains(n))
+        return std::string(TRI->getRegClass(i)->getName());
+    }
+  }
   return std::string(MRI->getRegClass(n)->getName());
 }
 
 bool RASimple::conservative(std::set<unsigned>& nodes) {
   std::unordered_map<std::string, std::pair<unsigned, unsigned>> RegClass;
   for (unsigned n: nodes) {
-    unsigned K = getPhysRegs(n).size();
-    if (InterGraph->getDegree(n) >= K) {
-      RegClass[getRegClassName(n)].first = K;
-      RegClass[getRegClassName(n)].second++;
+    if (TRI->isVirtualRegister(n)) {
+      unsigned K = getPhysRegs(n).size();
+      if (InterGraph->getDegree(n) >= K) {
+        RegClass[getRegClassName(n)].first = K;
+        RegClass[getRegClassName(n)].second++;
+      }
     }
+    else RegClass[getRegClassName(n)].second++;
   }
   for (auto& reg: RegClass) {
-    if (reg.second.second >= reg.second.first)
+    if (reg.second.second >= reg.second.first){
       return false;
+    }
   }
   return true;
 }
@@ -627,20 +604,17 @@ void RASimple::combine(unsigned u, unsigned v) {
     SpillWorklist.erase(v);
   CoalescedNodes.insert(v);
   Alias[v] = u;
-  std::set<MachineInstr*> temp;
-  std::set_union(MoveList[u].begin(), MoveList[u].end(),
-                 MoveList[v].begin(), MoveList[v].end(),
-                 std::inserter(temp, temp.begin()));
-  MoveList[u] = temp;
   for (unsigned t: adjacent(v)) {
     addEdge(t, u);
     decrementDegree(t);
   }
-  unsigned K = getPhysRegs(u).size();
-  if (InterGraph->getDegree(u) >= K
-      && FreezeWorklist.find(u) != FreezeWorklist.end()) {
-    FreezeWorklist.erase(u);
-    SpillWorklist.insert(u);
+  if (FreezeWorklist.find(u) != FreezeWorklist.end()) {
+    assert(TRI->isVirtualRegister(u) && "not virtual!");
+    unsigned K = getPhysRegs(u).size();
+    if (InterGraph->getDegree(u) >= K) {
+      FreezeWorklist.erase(u);
+      SpillWorklist.insert(u);
+    }
   }
 }
 
@@ -668,8 +642,7 @@ void RASimple::coalesce() {
     addWorklist(pair.second);
     return;
   }
-  bool allOK = false;
-  bool isConservative = false;
+  bool isConservative = false, allOK = false;
   if (UsedPhys.find(pair.first) != UsedPhys.end()) {
     allOK = true;
     for (unsigned t: adjacent(pair.second)) {
@@ -680,9 +653,11 @@ void RASimple::coalesce() {
     }
   }
   else {
-    std::set<unsigned> nodes;
-    std::set_union(adjacent(pair.first).begin(), adjacent(pair.first).end(),
-                   adjacent(pair.second).begin(), adjacent(pair.second).end(),
+    std::set<unsigned> nodes, adjU, adjV;
+    adjU = adjacent(pair.first);
+    adjV = adjacent(pair.second);
+    std::set_union(adjU.begin(), adjU.end(),
+                   adjV.begin(), adjV.end(),
                    std::inserter(nodes, nodes.begin()));
     isConservative = conservative(nodes);
   }
@@ -733,7 +708,6 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
   return true;
 }
 
-FunctionPass* llvm::createSimpleRegisterAllocator()
-{
+FunctionPass* llvm::createSimpleRegisterAllocator() {
   return new RASimple();
 }
