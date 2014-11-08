@@ -35,7 +35,7 @@ namespace llvm{
   FunctionPass* createSimpleRegisterAllocator();
 };
 
-static RegisterRegAlloc simpleRegAlloc("simple", "simple register allocator",
+static RegisterRegAlloc gcRegAlloc("gc", "graph coloring register allocator",
     createSimpleRegisterAllocator);
 
 namespace {
@@ -94,7 +94,7 @@ namespace {
       }
   };
 
-  class RASimple : public MachineFunctionPass {
+  class RAGraphColoring : public MachineFunctionPass {
     // context
     private:
       MachineFunction *MF;            //check
@@ -133,14 +133,14 @@ namespace {
         CoalescedNodes, ColoredNodes, SpilledNodes;
 
     public:
-      RASimple();
+      RAGraphColoring();
 
       /// Return the pass name.
       const char* getPassName() const override {
-        return "Simple Register Allocator";
+        return "Graph Coloring Register Allocator";
       }
 
-      /// RASimple analysis usage.
+      /// RAGraphColoring analysis usage.
       void getAnalysisUsage(AnalysisUsage &AU) const override;
 
       /// Perform register allocation.
@@ -182,11 +182,11 @@ namespace {
       void assignColors();
   };
 
-  char RASimple::ID = 0;
+  char RAGraphColoring::ID = 0;
 
 }
 
-RASimple::RASimple(): MachineFunctionPass(ID) {
+RAGraphColoring::RAGraphColoring(): MachineFunctionPass(ID) {
   initializeLiveDebugVariablesPass(*PassRegistry::getPassRegistry());
   initializeLiveIntervalsPass(*PassRegistry::getPassRegistry());
   initializeSlotIndexesPass(*PassRegistry::getPassRegistry());
@@ -200,7 +200,7 @@ RASimple::RASimple(): MachineFunctionPass(ID) {
 
 }
 
-void RASimple::getAnalysisUsage(AnalysisUsage &AU) const {
+void RAGraphColoring::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();
   AU.addRequired<AliasAnalysis>();
   AU.addPreserved<AliasAnalysis>();
@@ -224,7 +224,7 @@ void RASimple::getAnalysisUsage(AnalysisUsage &AU) const {
   MachineFunctionPass::getAnalysisUsage(AU);
 
 }
-void RASimple::init(MachineFunction &MF) {
+void RAGraphColoring::init(MachineFunction &MF) {
   this->MF  = &MF;
   this->MRI = &this->MF->getRegInfo();
   this->TM  = &this->MF->getTarget();
@@ -236,7 +236,7 @@ void RASimple::init(MachineFunction &MF) {
   RegClassInfo.runOnMachineFunction(VRM->getMachineFunction());
 }
 
-void RASimple::getAllRegs() {
+void RAGraphColoring::getAllRegs() {
   for (MachineBasicBlock& MBB: *MF) {
     for (MachineInstr& Instr: MBB) {
       std::set<unsigned> uses, defs;
@@ -257,7 +257,7 @@ void RASimple::getAllRegs() {
   }
 }
 
-void RASimple::getLiveness() {
+void RAGraphColoring::getLiveness() {
   std::set<unsigned> oldIn, oldOut;
 
   bool finished = false;
@@ -295,13 +295,13 @@ void RASimple::getLiveness() {
   }
 }
 
-void RASimple::livenessAnalysis() {
+void RAGraphColoring::livenessAnalysis() {
   getAllRegs();
   getLiveness();
 }
 
 
-void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
+void RAGraphColoring::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
     std::set<unsigned>& defs) {
   for (unsigned i = 0; i < Instr.getNumOperands(); i++) {
     MachineOperand& oper = Instr.getOperand(i);
@@ -325,11 +325,11 @@ void RASimple::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
     }
 }
 
-bool RASimple::isMoveInstr(MachineInstr& Instr) {
+bool RAGraphColoring::isMoveInstr(MachineInstr& Instr) {
   return Instr.isCopyLike();
 }
 
-void RASimple::releaseMemory() {
+void RAGraphColoring::releaseMemory() {
   BBRegs.clear();
   UsedPhys.clear();
   VirtRegs.clear();
@@ -349,7 +349,7 @@ void RASimple::releaseMemory() {
   Alias.clear();
 }
 
-std::set<unsigned> RASimple::adjacent(unsigned n) {
+std::set<unsigned> RAGraphColoring::adjacent(unsigned n) {
   std::set<unsigned> temp, adj, adjNodes;
   std::set_union(Stack.begin(), Stack.end(),
       CoalescedNodes.begin(), CoalescedNodes.end(),
@@ -361,7 +361,7 @@ std::set<unsigned> RASimple::adjacent(unsigned n) {
   return adj;
 }
 
-void RASimple::addEdge(unsigned u, unsigned v) {
+void RAGraphColoring::addEdge(unsigned u, unsigned v) {
   if (u != v && !InterGraph->isAdjSet(u, v)) {
     InterGraph->addSet(u, v);
     InterGraph->addSet(v, u);
@@ -372,7 +372,7 @@ void RASimple::addEdge(unsigned u, unsigned v) {
   }
 }
 
-void RASimple::buildInterferenceGraph() {
+void RAGraphColoring::buildInterferenceGraph() {
   if (InterGraph != nullptr) delete InterGraph;
 
   InterGraph = new Graph();
@@ -422,7 +422,7 @@ void RASimple::buildInterferenceGraph() {
   }
 }
 
-std::set<uint16_t> RASimple::getPhysRegs(unsigned VirtReg) {
+std::set<uint16_t> RAGraphColoring::getPhysRegs(unsigned VirtReg) {
   ArrayRef<uint16_t> regs = RegClassInfo.getOrder(MRI->getRegClass(VirtReg));
   std::set<uint16_t> AvailablePhys;
   for (size_t i = 0; i < regs.size(); i++)
@@ -430,7 +430,7 @@ std::set<uint16_t> RASimple::getPhysRegs(unsigned VirtReg) {
   return AvailablePhys;
 }
 
-void RASimple::makeWorklist() {
+void RAGraphColoring::makeWorklist() {
   for (unsigned VirtReg: VirtRegs) {
     unsigned K = getPhysRegs(VirtReg).size();
     if (InterGraph->getDegree(VirtReg) >= K)
@@ -442,7 +442,7 @@ void RASimple::makeWorklist() {
   }
 }
 
-std::set<MachineInstr*> RASimple::nodeMoves(unsigned node) {
+std::set<MachineInstr*> RAGraphColoring::nodeMoves(unsigned node) {
   std::set<MachineInstr*> temp;
   std::set_union(WorklistMoves.begin(), WorklistMoves.end(),
       ActiveMoves.begin(), ActiveMoves.end(),
@@ -454,11 +454,11 @@ std::set<MachineInstr*> RASimple::nodeMoves(unsigned node) {
   return tempUnion;
 }
 
-bool RASimple::moveRelated(unsigned node) {
+bool RAGraphColoring::moveRelated(unsigned node) {
   return !nodeMoves(node).empty();
 }
 
-void RASimple::enableMoves(std::set<unsigned>& nodes) {
+void RAGraphColoring::enableMoves(std::set<unsigned>& nodes) {
   for (unsigned n: nodes) {
     for (MachineInstr* m: nodeMoves(n)) {
       if (ActiveMoves.find(m) != ActiveMoves.end()) {
@@ -469,7 +469,7 @@ void RASimple::enableMoves(std::set<unsigned>& nodes) {
   }
 }
 
-void RASimple::decrementDegree(unsigned node) {
+void RAGraphColoring::decrementDegree(unsigned node) {
   if (UsedPhys.find(node) != UsedPhys.end()) return;
   unsigned d = InterGraph->getDegree(node);
   InterGraph->setDegree(node, d - 1);
@@ -487,7 +487,7 @@ void RASimple::decrementDegree(unsigned node) {
   }
 }
 
-void RASimple::simplify() {
+void RAGraphColoring::simplify() {
   unsigned n = *SimplifyWorklist.begin();
   SimplifyWorklist.erase(n);
   Stack.push_back(n);
@@ -496,13 +496,14 @@ void RASimple::simplify() {
   }
 }
 
-unsigned RASimple::getAlias(unsigned n) {
+unsigned RAGraphColoring::getAlias(unsigned n) {
   if (CoalescedNodes.find(n) != CoalescedNodes.end())
     return getAlias(Alias[n]);
   else return n;
 }
 
-void RASimple::getMoveReg(MachineInstr* Instr, unsigned& x, unsigned& y) {
+void RAGraphColoring::getMoveReg(MachineInstr* Instr, unsigned& x, 
+    unsigned& y) {
   std::vector<unsigned> regs;
   for (auto& val: MoveList) {
     if (val.second.find(Instr) != val.second.end())
@@ -513,7 +514,7 @@ void RASimple::getMoveReg(MachineInstr* Instr, unsigned& x, unsigned& y) {
   y = regs[1];
 }
 
-void RASimple::addWorklist(unsigned u) {
+void RAGraphColoring::addWorklist(unsigned u) {
   if (UsedPhys.find(u) == UsedPhys.end()) {
     unsigned K = getPhysRegs(u).size();
     if (!moveRelated(u) && InterGraph->getDegree(u) < K) {
@@ -523,7 +524,7 @@ void RASimple::addWorklist(unsigned u) {
   }
 }
 
-bool RASimple::OK(unsigned t, unsigned r) {
+bool RAGraphColoring::OK(unsigned t, unsigned r) {
   if (UsedPhys.find(t) != UsedPhys.end()) return true;
   assert(TRI->isVirtualRegister(t) && "not virtual!");
   unsigned K = getPhysRegs(t).size();
@@ -532,7 +533,7 @@ bool RASimple::OK(unsigned t, unsigned r) {
   return false;
 }
 
-std::string RASimple::getRegClassName(unsigned n) {
+std::string RAGraphColoring::getRegClassName(unsigned n) {
   if (UsedPhys.find(n) != UsedPhys.end()) {
     for (unsigned i = 0; i < TRI->getNumRegClasses(); i++) {
       if (TRI->getRegClass(i)->contains(n))
@@ -542,7 +543,7 @@ std::string RASimple::getRegClassName(unsigned n) {
   return std::string(MRI->getRegClass(n)->getName());
 }
 
-bool RASimple::conservative(std::set<unsigned>& nodes) {
+bool RAGraphColoring::conservative(std::set<unsigned>& nodes) {
   std::unordered_map<std::string, std::pair<unsigned, unsigned>> RegClass;
   for (unsigned n: nodes) {
     if (TRI->isVirtualRegister(n)) {
@@ -562,7 +563,7 @@ bool RASimple::conservative(std::set<unsigned>& nodes) {
   return true;
 }
 
-void RASimple::combine(unsigned u, unsigned v) {
+void RAGraphColoring::combine(unsigned u, unsigned v) {
   if (FreezeWorklist.find(v) != FreezeWorklist.end()) {
     FreezeWorklist.erase(v);
   }
@@ -584,7 +585,7 @@ void RASimple::combine(unsigned u, unsigned v) {
   }
 }
 
-void RASimple::coalesce() {
+void RAGraphColoring::coalesce() {
   MachineInstr* m = *WorklistMoves.begin();
   unsigned x, y;
   getMoveReg(m, x, y);
@@ -637,7 +638,7 @@ void RASimple::coalesce() {
   }
 }
 
-void RASimple::freezeMoves(unsigned u) {
+void RAGraphColoring::freezeMoves(unsigned u) {
   for (MachineInstr* m: nodeMoves(u)) {
     unsigned x, y, v;
     getMoveReg(m, x, y);
@@ -656,14 +657,14 @@ void RASimple::freezeMoves(unsigned u) {
   }
 }
 
-void RASimple::freeze() {
+void RAGraphColoring::freeze() {
   unsigned u = *FreezeWorklist.begin();
   FreezeWorklist.erase(u);
   SimplifyWorklist.insert(u);
   freezeMoves(u);
 }
 
-void RASimple::selectSpill() {
+void RAGraphColoring::selectSpill() {
   //TODO -> implement heuristic to get a node.
   unsigned m = *SpillWorklist.begin();
   SpillWorklist.erase(m);
@@ -671,7 +672,7 @@ void RASimple::selectSpill() {
   freezeMoves(m);
 }
 
-void RASimple::assignColors() {
+void RAGraphColoring::assignColors() {
   for (unsigned n: CoalescedNodes) {
     unsigned color = InterGraph->getColor(getAlias(n));
     std::set<uint16_t> colors = getPhysRegs(n);
@@ -703,7 +704,7 @@ void RASimple::assignColors() {
   }
 }
 
-bool RASimple::runOnMachineFunction(MachineFunction &mf) {
+bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
   DEBUG(dbgs() << "********** SIMPLE REGISTER ALLOCATION **********\n"
       << "********** Function: "  << mf.getName() << '\n');
 
@@ -725,14 +726,17 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
 
   assignColors();
 
-  Spiller* spiller = createInlineSpiller(*this, *MF, *VRM);
   for (unsigned n: VirtRegs) {
     if (SpilledNodes.find(n) == SpilledNodes.end()) {
       VRM->assignVirt2Phys(n, InterGraph->getColor(n));
+      UsedPhys.insert(InterGraph->getColor(n));
     }
-    else {    
-      SpilledNodes.erase(n);
-    }
+  }
+
+  Spiller* spiller = createInlineSpiller(*this, *MF, *VRM);
+  while (!SpilledNodes.empty()) {
+    unsigned n = *SpilledNodes.begin();
+    SpilledNodes.erase(n);
   }
   delete spiller;
 
@@ -744,5 +748,5 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
 }
 
 FunctionPass* llvm::createSimpleRegisterAllocator() {
-  return new RASimple();
+  return new RAGraphColoring();
 }
