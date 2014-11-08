@@ -94,43 +94,44 @@ namespace {
 
   class RASimple : public MachineFunctionPass {
     // context
-    MachineFunction *MF;            //check
-    const TargetRegisterInfo *TRI;  //check
-    const TargetMachine *TM;        //check
-    const TargetInstrInfo *TII;     //check
-    MachineRegisterInfo *MRI;       //check
-    VirtRegMap *VRM;                //check
-    LiveIntervals *LIS;
-    LiveRegMatrix *Matrix;
-    RegisterClassInfo RegClassInfo; //check
+    private:
+      MachineFunction *MF;            //check
+      const TargetRegisterInfo *TRI;  //check
+      const TargetMachine *TM;        //check
+      const TargetInstrInfo *TII;     //check
+      MachineRegisterInfo *MRI;       //check
+      VirtRegMap *VRM;                //check
+      LiveIntervals *LIS;
+      LiveRegMatrix *Matrix;
+      RegisterClassInfo RegClassInfo; //check
 
 
-    //1st set is Uses regs; 2nd is Defs regs
-    typedef std::pair<std::set<unsigned>, std::set<unsigned>> RegsMap;
-    typedef std::unordered_map<MachineBasicBlock*, RegsMap>  BBRegsMap;
-    BBRegsMap BBRegs;
+      //1st set is Uses regs; 2nd is Defs regs
+      typedef std::pair<std::set<unsigned>, std::set<unsigned>> RegsMap;
+      typedef std::unordered_map<MachineBasicBlock*, RegsMap>  BBRegsMap;
+      BBRegsMap BBRegs;
 
 
-    std::set<unsigned> UsedPhys, VirtRegs;
+      std::set<unsigned> UsedPhys, VirtRegs;
 
-    std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveOutRegs;
-    std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveInRegs;
+      std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveOutRegs;
+      std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveInRegs;
 
-    std::unordered_map<unsigned, std::set<MachineInstr*>> MoveList;
-    std::set<MachineInstr*> WorklistMoves, ActiveMoves, CoalescedMoves, 
-      ConstrainedMoves;
+      std::unordered_map<unsigned, std::set<MachineInstr*>> MoveList;
+      std::set<MachineInstr*> WorklistMoves, ActiveMoves, CoalescedMoves, 
+        ConstrainedMoves;
 
-    std::unordered_map<unsigned, unsigned> Alias;
+      std::unordered_map<unsigned, unsigned> Alias;
 
-    std::list<unsigned> Stack;
+      std::list<unsigned> Stack;
 
-    Graph* InterGraph;
+      Graph* InterGraph;
 
-    std::set<unsigned> SpillWorklist, FreezeWorklist, SimplifyWorklist,
-      CoalescedNodes, ColoredNodes, SpilledNodes;
+      std::set<unsigned> SpillWorklist, FreezeWorklist, SimplifyWorklist,
+        CoalescedNodes, ColoredNodes, SpilledNodes;
 
-    // state
-    Spiller *SpillerInstance;
+      // state
+      Spiller *SpillerInstance;
 
     public:
       RASimple();
@@ -150,7 +151,8 @@ namespace {
       /// RASimple analysis usage.
       void getAnalysisUsage(AnalysisUsage &AU) const override;
 
-      unsigned selectOrSpill(LiveInterval &VirtReg);
+      unsigned selectOrSplit(LiveInterval&, 
+          SmallVectorImpl<unsigned>&);
 
       /// Perform register allocation.
       bool runOnMachineFunction(MachineFunction &mf) override;
@@ -158,6 +160,8 @@ namespace {
       static char ID;
 
     private:
+      bool spillInterferences(LiveInterval&, unsigned, 
+          SmallVectorImpl<unsigned>&);
       void livenessAnalysis();
       void buildInterferenceGraph();
       void getAllRegs();
@@ -245,32 +249,87 @@ void RASimple::init(MachineFunction &MF) {
 }
 
 void RASimple::allocatePhysRegs() {
-  DEBUG(dbgs() << "********** LIVE REGISTERS **********\n" <<
-      "Num Virt Regs: " << MRI->getNumVirtRegs() << "\n");
-
-  // Continue assigning vregs one at a time to available physical registers.
-  for (unsigned i = 0; i < MRI->getNumVirtRegs(); i++){
+  std::vector<LiveInterval*> queue;
+  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
     unsigned Reg = TargetRegisterInfo::index2VirtReg(i);
-    if (!MRI->reg_nodbg_empty(Reg)){
-      LiveInterval *VirtReg = &LIS->getInterval(Reg);
+    if (MRI->reg_nodbg_empty(Reg))
+      continue;
+    queue.push_back(&LIS->getInterval(Reg));
+  }
+  // Continue assigning vregs one at a time to available physical registers.
+  while (!queue.empty()) {
+    LiveInterval* VirtReg = queue.back();
+    queue.pop_back();
+    assert(!VRM->hasPhys(VirtReg->reg) && "Register already assigned");
 
-      assert(!VRM->hasPhys(VirtReg->reg) && "Register already assigned");
+    // Unused registers can appear when the spiller coalesces snippets.
+    if (MRI->reg_nodbg_empty(VirtReg->reg)) {
+      DEBUG(dbgs() << "Dropping unused " << *VirtReg << '\n');
+      LIS->removeInterval(VirtReg->reg);
+      continue;
+    }
 
-      DEBUG(dbgs() << "\nselectOrSpill "
-          << MRI->getRegClass(VirtReg->reg)->getName()
-          << ':' << *VirtReg << '\n');
+    // Invalidate all interference queries, live ranges could have changed.
+    Matrix->invalidateVirtRegs();
 
-      unsigned AvailablePhysReg = selectOrSpill(*VirtReg);
+    // selectOrSplit requests the allocator to return an available physical
+    // register if possible and populate a list of new live intervals that
+    // result from splitting.
+    DEBUG(dbgs() << "\nselectOrSplit "
+        << MRI->getRegClass(VirtReg->reg)->getName()
+        << ':' << *VirtReg << " w=" << VirtReg->weight << '\n');
+    typedef SmallVector<unsigned, 4> VirtRegVec;
+    VirtRegVec SplitVRegs;
+    unsigned AvailablePhysReg = selectOrSplit(*VirtReg, SplitVRegs);
 
-      if (AvailablePhysReg) {
-        std::cout << VirtReg->reg << " -- " << AvailablePhysReg << " oi\n";
-        Matrix->assign(*VirtReg, AvailablePhysReg);
+    if (AvailablePhysReg == ~0u) {
+      // selectOrSplit failed to find a register!
+      // Probably caused by an inline asm.
+      MachineInstr *MI = nullptr;
+      for (MachineRegisterInfo::reg_instr_iterator
+          I = MRI->reg_instr_begin(VirtReg->reg), E = MRI->reg_instr_end();
+          I != E; ) {
+        MachineInstr *TmpMI = &*(I++);
+        if (TmpMI->isInlineAsm()) {
+          MI = TmpMI;
+          break;
+        }
       }
+      if (MI)
+        MI->emitError("inline assembly requires more registers than available");
+      else
+        report_fatal_error("ran out of registers during register allocation");
+      // Keep going after reporting the error.
+      VRM->assignVirt2Phys(VirtReg->reg,
+          RegClassInfo.getOrder(MRI->getRegClass(VirtReg->reg)).front());
+      continue;
+    }
+
+    if (AvailablePhysReg)
+      Matrix->assign(*VirtReg, AvailablePhysReg);
+
+    for (VirtRegVec::iterator I = SplitVRegs.begin(), E = SplitVRegs.end();
+        I != E; ++I) {
+      LiveInterval *SplitVirtReg = &LIS->getInterval(*I);
+      assert(!VRM->hasPhys(SplitVirtReg->reg) && "Register already assigned");
+      if (MRI->reg_nodbg_empty(SplitVirtReg->reg)) {
+        DEBUG(dbgs() << "not queueing unused  " << *SplitVirtReg << '\n');
+        LIS->removeInterval(SplitVirtReg->reg);
+        continue;
+      }
+      DEBUG(dbgs() << "queuing new interval: " << *SplitVirtReg << "\n");
+      assert(TargetRegisterInfo::isVirtualRegister(SplitVirtReg->reg) &&
+          "expect split value in virtual register");
+      queue.push_back(SplitVirtReg);
     }
   }
 }
 
-unsigned RASimple::selectOrSpill(LiveInterval &VirtReg) {
+unsigned RASimple::selectOrSplit(LiveInterval& VirtReg,
+    SmallVectorImpl<unsigned>& SplitVRegs) {
+  // Populate a list of physical register spill candidates.
+  SmallVector<unsigned, 8> PhysRegSpillCands;
+
   // Check for an available register in this class.
   AllocationOrder Order(VirtReg.reg, *VRM, RegClassInfo);
   while (unsigned PhysReg = Order.next()) {
@@ -280,18 +339,82 @@ unsigned RASimple::selectOrSpill(LiveInterval &VirtReg) {
         // PhysReg is available, allocate it.
         return PhysReg;
 
+      case LiveRegMatrix::IK_VirtReg:
+        // Only virtual registers in the way, we may be able to spill them.
+        PhysRegSpillCands.push_back(PhysReg);
+        continue;
+
       default:
-        // Virt Reg, RegMask or RegUnit interference.
+        // RegMask or RegUnit interference.
         continue;
     }
   }
+
+  // Try to spill another interfering reg with less spill weight.
+  for (SmallVectorImpl<unsigned>::iterator PhysRegI = PhysRegSpillCands.begin(),
+      PhysRegE = PhysRegSpillCands.end(); PhysRegI != PhysRegE; ++PhysRegI) {
+    if (!spillInterferences(VirtReg, *PhysRegI, SplitVRegs))
+      continue;
+
+    assert(!Matrix->checkInterference(VirtReg, *PhysRegI) &&
+        "Interference after spill.");
+    // Tell the caller to allocate to this newly freed physical register.
+    return *PhysRegI;
+  }
+
   // No other spill candidates were found, so spill the current VirtReg.
   DEBUG(dbgs() << "spilling: " << VirtReg << '\n');
-  SmallVector<unsigned, 1> VirtVet;
-  LiveRangeEdit LRE(&VirtReg, VirtVet, *MF, *LIS, VRM);
+  if (!VirtReg.isSpillable())
+    return ~0u;
+  LiveRangeEdit LRE(&VirtReg, SplitVRegs, *MF, *LIS, VRM);
   SpillerInstance->spill(LRE);
 
+  // The live virtual register requesting allocation was spilled, so tell
+  // the caller not to allocate anything during this round.
   return 0;
+
+}
+
+bool RASimple::spillInterferences(LiveInterval &VirtReg, unsigned PhysReg,
+    SmallVectorImpl<unsigned> &SplitVRegs) {
+  // Record each interference and determine if all are spillable before mutating
+  // either the union or live intervals.
+  SmallVector<LiveInterval*, 8> Intfs;
+
+  // Collect interferences assigned to any alias of the physical register.
+  for (MCRegUnitIterator Units(PhysReg, TRI); Units.isValid(); ++Units) {
+    LiveIntervalUnion::Query &Q = Matrix->query(VirtReg, *Units);
+    Q.collectInterferingVRegs();
+    if (Q.seenUnspillableVReg())
+      return false;
+    for (unsigned i = Q.interferingVRegs().size(); i; --i) {
+      LiveInterval *Intf = Q.interferingVRegs()[i - 1];
+      if (!Intf->isSpillable() || Intf->weight > VirtReg.weight)
+        return false;
+      Intfs.push_back(Intf);
+    }
+  }
+  DEBUG(dbgs() << "spilling " << TRI->getName(PhysReg) <<
+      " interferences with " << VirtReg << "\n");
+  assert(!Intfs.empty() && "expected interference");
+
+  // Spill each interfering vreg allocated to PhysReg or an alias.
+  for (unsigned i = 0, e = Intfs.size(); i != e; ++i) {
+    LiveInterval &Spill = *Intfs[i];
+
+    // Skip duplicates.
+    if (!VRM->hasPhys(Spill.reg))
+      continue;
+
+    // Deallocate the interfering vreg by removing it from the union.
+    // A LiveInterval instance may not be in a union during modification!
+    Matrix->unassign(Spill);
+
+    // Spill the extracted interval.
+    LiveRangeEdit LRE(&Spill, SplitVRegs, *MF, *LIS, VRM);
+    SpillerInstance->spill(LRE);
+  }
+  return true;
 }
 
 void RASimple::getAllRegs() {
@@ -787,29 +910,25 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
 
   SpillerInstance = createInlineSpiller(*this, *this->MF, *this->VRM);
 
-  //VRM->clearAllVirt();
-
   for (unsigned n: InterGraph->getNodes()) {
     std::cout << n << ": " << InterGraph->getColor(n) << std::endl;
     if (InterGraph->getColor(n) != 0) {
       VRM->assignVirt2Phys(n, InterGraph->getColor(n));
     }
     else if (SpilledNodes.find(n) == SpilledNodes.end()) {
+      VRM->assignVirt2Phys(n, getAlias(n));
       for (MachineInstr* instr: MoveList[n])
         instr->eraseFromParent();
-      //LiveInterval* VirtReg = &LIS->getInterval(n);
-      //SmallVector<unsigned, 4> VirtVet;
-      //LiveRangeEdit LRE(VirtReg, VirtVet, *MF, *LIS, VRM);
-      //SpillerInstance->spill(LRE);
     }
   }
   while (!SpilledNodes.empty()) {
     unsigned n = *SpilledNodes.begin();
-    LiveInterval* VirtReg = &LIS->getInterval(n);
-    SmallVector<unsigned, 1> VirtVet;
-    LiveRangeEdit LRE(VirtReg, VirtVet, *MF, *LIS, VRM);
-    SpillerInstance->spill(LRE);
+    VRM->assignVirt2StackSlot(n);
   }
+
+  //calculateSpillWeightsAndHints(*LIS, *MF,
+  //                            getAnalysis<MachineLoopInfo>(),
+  //                            getAnalysis<MachineBlockFrequencyInfo>());
 
   //allocatePhysRegs();
 
