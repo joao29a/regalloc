@@ -672,6 +672,13 @@ void RASimple::selectSpill() {
 }
 
 void RASimple::assignColors() {
+  for (unsigned n: CoalescedNodes) {
+    unsigned color = InterGraph->getColor(getAlias(n));
+    std::set<uint16_t> colors = getPhysRegs(n);
+    if (colors.find(color) != colors.end())
+      InterGraph->setColor(n, color);
+    else Stack.push_back(n);
+  }
   while (!Stack.empty()) {
     unsigned n = Stack.back();
     Stack.pop_back();
@@ -693,9 +700,6 @@ void RASimple::assignColors() {
       unsigned c = *okColors.begin();
       InterGraph->setColor(n, c);
     }
-  }
-  for (unsigned n: CoalescedNodes) {
-    InterGraph->setColor(n, InterGraph->getColor(getAlias(n)));
   }
 }
 
@@ -721,23 +725,16 @@ bool RASimple::runOnMachineFunction(MachineFunction &mf) {
 
   assignColors();
 
+  Spiller* spiller = createInlineSpiller(*this, *MF, *VRM);
   for (unsigned n: VirtRegs) {
-    if (InterGraph->getColor(n) != 0) {
-      std::cout << n << ": " << InterGraph->getColor(n) << std::endl;
+    if (SpilledNodes.find(n) == SpilledNodes.end()) {
       VRM->assignVirt2Phys(n, InterGraph->getColor(n));
     }
-    else if (SpilledNodes.find(n) == SpilledNodes.end()) {
-      std::cout << n << ": " << getAlias(n) << std::endl;
-      VRM->assignVirt2Phys(n, getAlias(n));
-      for (MachineInstr* instr: MoveList[n]) {
-        instr->eraseFromParent();
-      }
+    else {    
+      SpilledNodes.erase(n);
     }
   }
-  while (!SpilledNodes.empty()) {
-    unsigned n = *SpilledNodes.begin();
-    VRM->assignVirt2StackSlot(n);
-  }
+  delete spiller;
 
   std::cout << "\n";
 
