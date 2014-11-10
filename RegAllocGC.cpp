@@ -8,6 +8,7 @@
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
@@ -17,6 +18,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetRegisterInfo.h"
+#include "llvm/Target/TargetInstrInfo.h"
 #include "llvm/CodeGen/LiveInterval.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include <set>
@@ -120,6 +122,8 @@ namespace {
 
       std::unordered_map<unsigned, unsigned> Alias;
 
+      std::unordered_map<unsigned, int> StackSlot;
+
       std::list<unsigned> Stack;
 
       Graph* InterGraph;
@@ -175,6 +179,8 @@ namespace {
       void freeze();
       void selectSpill();
       void assignColors();
+      int getStackSpaceFor(unsigned);
+      void rewriteProgram();
   };
 
   char RAGraphColoring::ID = 0;
@@ -336,6 +342,7 @@ void RAGraphColoring::releaseMemory() {
   ColoredNodes.clear();
   SpilledNodes.clear();
   Alias.clear();
+  StackSlot.clear();
 }
 
 std::set<unsigned> RAGraphColoring::adjacent(unsigned n) {
@@ -693,38 +700,75 @@ void RAGraphColoring::assignColors() {
   }
 }
 
+int RAGraphColoring::getStackSpaceFor(unsigned VirtReg) {
+  if (StackSlot.find(VirtReg) != StackSlot.end())
+    return StackSlot[VirtReg];
+  const TargetRegisterClass *RC = MRI->getRegClass(VirtReg);
+  StackSlot[VirtReg] = MF->getFrameInfo()->CreateSpillStackObject(RC->getSize(),
+                                                    RC->getAlignment());
+  return StackSlot[VirtReg];
+}
+
+void RAGraphColoring::rewriteProgram() {
+  for (MachineBasicBlock& MBB: *MF) {
+    for (MachineBasicBlock::iterator MI = MBB.begin(); MI != MBB.end(); MI++) {
+      for (unsigned i = 0; i < MI->getNumOperands(); i++) {
+        MachineOperand& oper = MI->getOperand(i);
+        if (oper.isReg() 
+            && SpilledNodes.find(oper.getReg()) != SpilledNodes.end()) {
+          unsigned Reg = oper.getReg();
+          int FrameIdx = getStackSpaceFor(Reg);
+          const TargetRegisterClass *RC = MRI->getRegClass(Reg);
+          if (oper.isUse()) {
+            TII->loadRegFromStackSlot(MBB, MI, Reg, FrameIdx, RC, TRI);
+          }
+          else if (oper.isDef()) {
+            TII->storeRegToStackSlot(MBB, next(MI), Reg, false, FrameIdx, RC, TRI);
+          }
+        }
+      }
+    }
+  }
+}
+
 bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
-  DEBUG(dbgs() << "********** SIMPLE REGISTER ALLOCATION **********\n"
+  DEBUG(dbgs() << "********** GRAPH COLORING REGISTER ALLOCATION **********\n"
       << "********** Function: "  << mf.getName() << '\n');
+
+  std::cout << std::string(mf.getName()) << "\n";
 
   init(mf);
 
-  livenessAnalysis();
+  bool finished = false;
 
-  buildInterferenceGraph();
+  while (!finished) {
 
-  makeWorklist();
+    livenessAnalysis();
 
-  while (!SimplifyWorklist.empty() || !WorklistMoves.empty()
-      || !FreezeWorklist.empty() || !SpillWorklist.empty()) {
-    if (!SimplifyWorklist.empty()) simplify();
-    else if (!WorklistMoves.empty()) coalesce();
-    else if (!FreezeWorklist.empty()) freeze();
-    else if (!SpillWorklist.empty()) selectSpill();
-  }
+    buildInterferenceGraph();
 
-  assignColors();
+    makeWorklist();
 
-  for (unsigned n: VirtRegs) {
-    if (SpilledNodes.find(n) == SpilledNodes.end()) {
-      VRM->assignVirt2Phys(n, InterGraph->getColor(n));
-      UsedPhys.insert(InterGraph->getColor(n));
+    while (!SimplifyWorklist.empty() || !WorklistMoves.empty()
+        || !FreezeWorklist.empty() || !SpillWorklist.empty()) {
+      if (!SimplifyWorklist.empty()) simplify();
+      else if (!WorklistMoves.empty()) coalesce();
+      else if (!FreezeWorklist.empty()) freeze();
+      else if (!SpillWorklist.empty()) selectSpill();
+    }
+
+    assignColors();
+
+    finished = true;
+    if (!SpilledNodes.empty()) {
+      finished = false;
+      rewriteProgram();
+      releaseMemory();
     }
   }
 
-  while (!SpilledNodes.empty()) {
-    unsigned n = *SpilledNodes.begin();
-    SpilledNodes.erase(n);
+  for (unsigned n: VirtRegs) {
+    VRM->assignVirt2Phys(n, InterGraph->getColor(n));
   }
 
   releaseMemory();
