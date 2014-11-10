@@ -1,6 +1,3 @@
-#include "../../CodeGen/AllocationOrder.h"
-#include "../../CodeGen/LiveDebugVariables.h"
-#include "../../CodeGen/Spiller.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
@@ -103,8 +100,6 @@ namespace {
       const TargetInstrInfo *TII;     //check
       MachineRegisterInfo *MRI;       //check
       VirtRegMap *VRM;                //check
-      LiveIntervals *LIS;
-      LiveRegMatrix *Matrix;
       RegisterClassInfo RegClassInfo; //check
 
 
@@ -187,7 +182,6 @@ namespace {
 }
 
 RAGraphColoring::RAGraphColoring(): MachineFunctionPass(ID) {
-  initializeLiveDebugVariablesPass(*PassRegistry::getPassRegistry());
   initializeLiveIntervalsPass(*PassRegistry::getPassRegistry());
   initializeSlotIndexesPass(*PassRegistry::getPassRegistry());
   initializeRegisterCoalescerPass(*PassRegistry::getPassRegistry());
@@ -197,7 +191,6 @@ RAGraphColoring::RAGraphColoring(): MachineFunctionPass(ID) {
   initializeMachineLoopInfoPass(*PassRegistry::getPassRegistry());
   initializeVirtRegMapPass(*PassRegistry::getPassRegistry());
   initializeLiveRegMatrixPass(*PassRegistry::getPassRegistry());
-
 }
 
 void RAGraphColoring::getAnalysisUsage(AnalysisUsage &AU) const {
@@ -207,8 +200,6 @@ void RAGraphColoring::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<LiveIntervals>();
   AU.addPreserved<LiveIntervals>();
   AU.addPreserved<SlotIndexes>();
-  AU.addRequired<LiveDebugVariables>();
-  AU.addPreserved<LiveDebugVariables>();
   AU.addRequired<LiveStacks>();
   AU.addPreserved<LiveStacks>();
   AU.addRequired<MachineBlockFrequencyInfo>();
@@ -222,8 +213,8 @@ void RAGraphColoring::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<LiveRegMatrix>();
   AU.addPreserved<LiveRegMatrix>();
   MachineFunctionPass::getAnalysisUsage(AU);
-
 }
+
 void RAGraphColoring::init(MachineFunction &MF) {
   this->MF  = &MF;
   this->MRI = &this->MF->getRegInfo();
@@ -231,8 +222,6 @@ void RAGraphColoring::init(MachineFunction &MF) {
   this->TII = this->TM->getInstrInfo();
   this->TRI = this->TM->getRegisterInfo();
   this->VRM = &getAnalysis<VirtRegMap>();
-  this->LIS = &getAnalysis<LiveIntervals>();
-  this->Matrix = &getAnalysis<LiveRegMatrix>();
   RegClassInfo.runOnMachineFunction(VRM->getMachineFunction());
 }
 
@@ -733,14 +722,10 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
     }
   }
 
-  Spiller* spiller = createInlineSpiller(*this, *MF, *VRM);
   while (!SpilledNodes.empty()) {
     unsigned n = *SpilledNodes.begin();
     SpilledNodes.erase(n);
   }
-  delete spiller;
-
-  std::cout << "\n";
 
   releaseMemory();
 
