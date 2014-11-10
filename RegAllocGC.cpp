@@ -336,6 +336,7 @@ void RAGraphColoring::releaseMemory() {
   MoveList.clear();
   WorklistMoves.clear();
   CoalescedMoves.clear();
+  ActiveMoves.clear();
   ConstrainedMoves.clear();
   Stack.clear();
   CoalescedNodes.clear();
@@ -719,12 +720,14 @@ void RAGraphColoring::rewriteProgram() {
           unsigned Reg = oper.getReg();
           int FrameIdx = getStackSpaceFor(Reg);
           const TargetRegisterClass *RC = MRI->getRegClass(Reg);
+          unsigned NewReg = MRI->createVirtualRegister(RC);
           if (oper.isUse()) {
-            TII->loadRegFromStackSlot(MBB, MI, Reg, FrameIdx, RC, TRI);
+            TII->loadRegFromStackSlot(MBB, MI, NewReg, FrameIdx, RC, TRI);
           }
           else if (oper.isDef()) {
-            TII->storeRegToStackSlot(MBB, next(MI), Reg, false, FrameIdx, RC, TRI);
+            TII->storeRegToStackSlot(MBB, next(MI), NewReg, true, FrameIdx, RC, TRI);
           }
+          oper.setReg(NewReg);
         }
       }
     }
@@ -738,7 +741,7 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
   std::cout << std::string(mf.getName()) << "\n";
 
   init(mf);
-
+  
   bool finished = false;
 
   while (!finished) {
