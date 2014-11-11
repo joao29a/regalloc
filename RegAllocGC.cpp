@@ -21,6 +21,7 @@
 #include "llvm/Target/TargetInstrInfo.h"
 #include "llvm/CodeGen/LiveInterval.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
+#include "LiveOutSets.h"
 #include <set>
 #include <unordered_map>
 #include <iostream>
@@ -54,10 +55,8 @@ namespace {
       }
 
       bool isAdjSet(unsigned u, unsigned v) {
-        if ((AdjSet.find(std::make_pair(u, v)) != AdjSet.end())
-            || (AdjSet.find(std::make_pair(v, u)) != AdjSet.end()))
-          return true;
-        return false;
+        return (AdjSet.find(std::make_pair(u, v)) != AdjSet.end()
+            || AdjSet.find(std::make_pair(v, u)) != AdjSet.end());
       }
 
       void addEdge(unsigned u , unsigned v) {
@@ -91,6 +90,11 @@ namespace {
           return Color[reg];
         else return reg;
       }
+
+      bool hasEdge(unsigned u, unsigned v) {
+        return (AdjList[u].find(v) != AdjList[u].end()
+            || AdjList[v].find(u) != AdjList[v].end());
+      }
   };
 
   class RAGraphColoring : public MachineFunctionPass {
@@ -103,6 +107,8 @@ namespace {
       MachineRegisterInfo *MRI;       //check
       VirtRegMap *VRM;                //check
       RegisterClassInfo RegClassInfo; //check
+      LiveIntervals *LIS;
+      VirtRegAuxInfo *VRAI;
 
 
       //1st set is Uses regs; 2nd is Defs regs
@@ -129,7 +135,7 @@ namespace {
       Graph* InterGraph;
 
       std::set<unsigned> SpillWorklist, FreezeWorklist, SimplifyWorklist,
-        CoalescedNodes, ColoredNodes, SpilledNodes;
+        CoalescedNodes, ColoredNodes, SpilledNodes, newTemps;
 
     public:
       RAGraphColoring();
@@ -151,6 +157,7 @@ namespace {
       void init(MachineFunction &MF);
       void livenessAnalysis();
       void buildInterferenceGraph();
+      void isGraphCorrect();
       void getAllRegs();
       void getLiveness();
       void getSuccessor(MachineBasicBlock&, std::set<MachineBasicBlock*>&,
@@ -164,6 +171,7 @@ namespace {
       std::set<MachineInstr*> nodeMoves(unsigned);
       std::set<unsigned> adjacent(unsigned);
       std::string getRegClassName(unsigned);
+      unsigned getSpillWorklistNode();
       void enableMoves(std::set<unsigned>&);
       void addWorklist(unsigned);
       void getMoveReg(MachineInstr*, unsigned&, unsigned&);
@@ -200,7 +208,8 @@ RAGraphColoring::RAGraphColoring(): MachineFunctionPass(ID) {
 }
 
 void RAGraphColoring::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.setPreservesCFG();
+  AU.setPreservesAll();
+  AU.addRequiredID(PHIEliminationID);
   AU.addRequired<AliasAnalysis>();
   AU.addPreserved<AliasAnalysis>();
   AU.addRequired<LiveIntervals>();
@@ -228,6 +237,7 @@ void RAGraphColoring::init(MachineFunction &MF) {
   this->TII = this->TM->getInstrInfo();
   this->TRI = this->TM->getRegisterInfo();
   this->VRM = &getAnalysis<VirtRegMap>();
+  this->LIS = &getAnalysis<LiveIntervals>();
   RegClassInfo.runOnMachineFunction(VRM->getMachineFunction());
 }
 
@@ -293,6 +303,8 @@ void RAGraphColoring::getLiveness() {
 void RAGraphColoring::livenessAnalysis() {
   getAllRegs();
   getLiveness();
+  for (unsigned n: VirtRegs)
+    Alias[n] = n;
 }
 
 
@@ -374,8 +386,10 @@ void RAGraphColoring::buildInterferenceGraph() {
 
   InterGraph = new Graph();
 
+  LiveOutSets* los = new LiveOutSets(*MF);
+
   for (MachineBasicBlock& MBB: *MF) {
-    std::set<unsigned> live = LiveOutRegs[&MBB];
+    std::set<unsigned> live(los->getAliveOutSet(&MBB));// = LiveOutRegs[&MBB];
     for (MachineBasicBlock::reverse_instr_iterator instrIt = MBB.instr_rbegin();
         instrIt != MBB.instr_rend(); instrIt++) {
       MachineInstr& Instr = *instrIt;
@@ -404,8 +418,9 @@ void RAGraphColoring::buildInterferenceGraph() {
           std::inserter(temp, temp.begin()));
       live = temp;
       for (unsigned d: defs) {
-        for (unsigned l: live)
+        for (unsigned l: live){
           addEdge(l, d);
+        }
       }
       temp.clear();
       std::set_difference(live.begin(), live.end(),
@@ -437,6 +452,10 @@ void RAGraphColoring::makeWorklist() {
     else
       SimplifyWorklist.insert(VirtReg);
   }
+  std::cout << SpillWorklist.size() << "\n";
+  std::cout << WorklistMoves.size() << "\n";
+  std::cout << FreezeWorklist.size() << "\n";
+  std::cout << SimplifyWorklist.size() << "\n\n";
 }
 
 std::set<MachineInstr*> RAGraphColoring::nodeMoves(unsigned node) {
@@ -661,9 +680,21 @@ void RAGraphColoring::freeze() {
   freezeMoves(u);
 }
 
+unsigned RAGraphColoring::getSpillWorklistNode() {
+  unsigned bestNode = 0, minWeight = std::numeric_limits<unsigned>::max();
+  for (unsigned m: SpillWorklist) {
+    unsigned degree = InterGraph->getDegree(m);
+    if (degree < minWeight) {
+      bestNode  = m;
+      minWeight = degree;
+    }
+  }
+  //if (bestNode == 0) return *SpillWorklist.begin();
+  return bestNode;
+}
+
 void RAGraphColoring::selectSpill() {
-  //TODO -> implement heuristic to get a node.
-  unsigned m = *SpillWorklist.begin();
+  unsigned m = getSpillWorklistNode();
   SpillWorklist.erase(m);
   SimplifyWorklist.insert(m);
   freezeMoves(m);
@@ -706,11 +737,12 @@ int RAGraphColoring::getStackSpaceFor(unsigned VirtReg) {
     return StackSlot[VirtReg];
   const TargetRegisterClass *RC = MRI->getRegClass(VirtReg);
   StackSlot[VirtReg] = MF->getFrameInfo()->CreateSpillStackObject(RC->getSize(),
-                                                    RC->getAlignment());
+      RC->getAlignment());
   return StackSlot[VirtReg];
 }
 
 void RAGraphColoring::rewriteProgram() {
+  //newTemps.clear();
   for (MachineBasicBlock& MBB: *MF) {
     for (MachineBasicBlock::iterator MI = MBB.begin(); MI != MBB.end(); MI++) {
       for (unsigned i = 0; i < MI->getNumOperands(); i++) {
@@ -721,6 +753,7 @@ void RAGraphColoring::rewriteProgram() {
           int FrameIdx = getStackSpaceFor(Reg);
           const TargetRegisterClass *RC = MRI->getRegClass(Reg);
           unsigned NewReg = MRI->createVirtualRegister(RC);
+          //newTemps.insert(NewReg);
           if (oper.isUse()) {
             TII->loadRegFromStackSlot(MBB, MI, NewReg, FrameIdx, RC, TRI);
           }
@@ -734,21 +767,42 @@ void RAGraphColoring::rewriteProgram() {
   }
 }
 
+//void RAGraphColoring::isGraphCorrect() {
+//  for (unsigned n: VirtRegs) {
+//    LiveInterval* li_n = &LIS->getInterval(n);
+//    for (unsigned m: VirtRegs) {
+//      if (n == m) continue;
+//      LiveInterval* li_m = &LIS->getInterval(m);
+//      if (li_n->overlaps(*li_m)){
+//        if (!InterGraph->isAdjSet(n, m) || !InterGraph->hasEdge(n, m))
+//      }
+//      else
+//        if (InterGraph->isAdjSet(n, m) || InterGraph->hasEdge(n, m))
+//    }
+//  }
+//  //std::cout << InterGraph->getNodes().size() << " nodes\n";
+//  //for (unsigned m: InterGraph->getNodes()) {
+//  //  std::cout << m << ": " << InterGraph->getDegree(m) << "\n";
+//  //}
+//}
+
 bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
   DEBUG(dbgs() << "********** GRAPH COLORING REGISTER ALLOCATION **********\n"
       << "********** Function: "  << mf.getName() << '\n');
 
-  std::cout << std::string(mf.getName()) << "\n";
-
   init(mf);
-  
+
   bool finished = false;
 
-  while (!finished) {
+  //calculateSpillWeightsAndHints(*LIS, *MF, getAnalysis<MachineLoopInfo>(),
+  //    getAnalysis<MachineBlockFrequencyInfo>());
 
+  while (!finished) {
     livenessAnalysis();
 
     buildInterferenceGraph();
+
+    //isGraphCorrect();
 
     makeWorklist();
 
