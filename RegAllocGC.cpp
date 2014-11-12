@@ -108,6 +108,7 @@ namespace {
       VirtRegMap *VRM;                //check
       RegisterClassInfo RegClassInfo; //check
       LiveIntervals *LIS;
+      SlotIndexes* SI;
 
 
       //1st set is Uses regs; 2nd is Defs regs
@@ -196,7 +197,7 @@ namespace {
 
 RAGraphColoring::RAGraphColoring(): MachineFunctionPass(ID) {
   //initializeLiveIntervalsPass(*PassRegistry::getPassRegistry());
-  //initializeSlotIndexesPass(*PassRegistry::getPassRegistry());
+  initializeSlotIndexesPass(*PassRegistry::getPassRegistry());
   //initializeRegisterCoalescerPass(*PassRegistry::getPassRegistry());
   //initializeMachineSchedulerPass(*PassRegistry::getPassRegistry());
   //initializeLiveStacksPass(*PassRegistry::getPassRegistry());
@@ -211,9 +212,10 @@ void RAGraphColoring::getAnalysisUsage(AnalysisUsage &AU) const {
   //AU.addRequiredID(PHIEliminationID);
   //AU.addRequired<AliasAnalysis>();
   //AU.addPreserved<AliasAnalysis>();
-  AU.addRequired<LiveIntervals>();
-  AU.addPreserved<LiveIntervals>();
-  //AU.addPreserved<SlotIndexes>();
+  //AU.addRequired<LiveIntervals>();
+  //AU.addPreserved<LiveIntervals>();
+  AU.addPreserved<SlotIndexes>();
+  AU.addRequired<SlotIndexes>();
   //AU.addRequired<LiveStacks>();
   //AU.addPreserved<LiveStacks>();
   //AU.addRequired<MachineBlockFrequencyInfo>();
@@ -236,7 +238,8 @@ void RAGraphColoring::init(MachineFunction &MF) {
   this->TII = this->TM->getInstrInfo();
   this->TRI = this->TM->getRegisterInfo();
   this->VRM = &getAnalysis<VirtRegMap>();
-  this->LIS = &getAnalysis<LiveIntervals>();
+  this->SI  = &getAnalysis<SlotIndexes>();
+  //this->LIS = &getAnalysis<LiveIntervals>();
   //MRI->freezeReservedRegs(VRM->getMachineFunction());
   RegClassInfo.runOnMachineFunction(VRM->getMachineFunction());
 }
@@ -380,8 +383,8 @@ void RAGraphColoring::addEdge(unsigned u, unsigned v) {
 }
 
 void RAGraphColoring::buildInterferenceGraph() {
-  if (InterGraph != nullptr) delete InterGraph;
-
+  //if (InterGraph != nullptr) delete InterGraph;
+  
   InterGraph = new Graph();
 
   LiveOutSets* los = new LiveOutSets(*MF);
@@ -394,16 +397,25 @@ void RAGraphColoring::buildInterferenceGraph() {
       std::set<unsigned> uses, defs, temp;
       getUsesDefs(Instr, uses, defs);
       if (isMoveInstr(Instr)) {
-        live.erase(*uses.begin());
-
-        std::set<unsigned> UsesDefs;
-        std::set_union(uses.begin(), uses.end(),
-            defs.begin(), defs.end(),
-            std::inserter(UsesDefs, UsesDefs.begin()));
-        for (unsigned n: UsesDefs) {
-          MoveList[n].insert(&Instr);
+        bool insertMove = false;
+        if (TRI->isVirtualRegister(*uses.begin()) 
+            && TRI->isPhysicalRegister(*defs.begin())) {
+          std::set<uint16_t> regs = getPhysRegs(*uses.begin());
+          if (regs.find(*defs.begin()) != regs.end())
+            insertMove = true;
         }
-        WorklistMoves.insert(&Instr);
+        if (insertMove) {
+          live.erase(*uses.begin());
+
+          std::set<unsigned> UsesDefs;
+          std::set_union(uses.begin(), uses.end(),
+              defs.begin(), defs.end(),
+              std::inserter(UsesDefs, UsesDefs.begin()));
+          for (unsigned n: UsesDefs) {
+            MoveList[n].insert(&Instr);
+          }
+          WorklistMoves.insert(&Instr);
+        }
       }
       std::copy(defs.begin(), defs.end(),
           std::inserter(live, live.begin()));
@@ -692,10 +704,7 @@ void RAGraphColoring::selectSpill() {
 void RAGraphColoring::assignColors() {
   for (unsigned n: CoalescedNodes) {
     unsigned color = InterGraph->getColor(getAlias(n));
-    std::set<uint16_t> colors = getPhysRegs(n);
-    if (colors.find(color) != colors.end())
-      InterGraph->setColor(n, color);
-    else Stack.push_back(n);
+    InterGraph->setColor(n, color);
   }
   while (!Stack.empty()) {
     unsigned n = Stack.back();
@@ -745,7 +754,6 @@ int RAGraphColoring::getStackSpaceFor(unsigned VirtReg) {
 }
 
 void RAGraphColoring::rewriteProgram() {
-  //newTemps.clear();
   for (MachineBasicBlock& MBB: *MF) {
     for (MachineBasicBlock::iterator MI = MBB.begin(); MI != MBB.end(); MI++) {
       for (unsigned i = 0; i < MI->getNumOperands(); i++) {
@@ -756,14 +764,14 @@ void RAGraphColoring::rewriteProgram() {
           int FrameIdx = getStackSpaceFor(Reg);
           const TargetRegisterClass *RC = MRI->getRegClass(Reg);
           unsigned NewReg = MRI->createVirtualRegister(RC);
-          //newTemps.insert(NewReg);
+          oper.setReg(NewReg);
           if (oper.isUse()) {
             TII->loadRegFromStackSlot(MBB, MI, NewReg, FrameIdx, RC, TRI);
           }
           else if (oper.isDef()) {
-            TII->storeRegToStackSlot(MBB, next(MI), NewReg, true, FrameIdx, RC, TRI);
+            TII->storeRegToStackSlot(MBB, next(MI), NewReg, oper.isKill(), FrameIdx, RC, TRI);
           }
-          oper.setReg(NewReg);
+          SI->repairIndexesInRange(&MBB, MBB.begin(), MBB.end());
         }
       }
     }
@@ -807,7 +815,7 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
 
     buildInterferenceGraph();
 
-    isGraphCorrect();
+    //isGraphCorrect();
 
     makeWorklist();
 
@@ -823,11 +831,13 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
 
     finished = true;
     if (!SpilledNodes.empty()) {
+      std::cout << SpilledNodes.size() << " aa\n";
       finished = false;
       rewriteProgram();
       releaseMemory();
     }
   }
+
 
   //int i = 0;
   //for (int j = 0; j < MRI->getNumVirtRegs(); j++) {
