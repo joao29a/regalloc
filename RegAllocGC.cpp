@@ -108,7 +108,6 @@ namespace {
       VirtRegMap *VRM;                //check
       RegisterClassInfo RegClassInfo; //check
       LiveIntervals *LIS;
-      VirtRegAuxInfo *VRAI;
 
 
       //1st set is Uses regs; 2nd is Defs regs
@@ -304,8 +303,6 @@ void RAGraphColoring::getLiveness() {
 void RAGraphColoring::livenessAnalysis() {
   getAllRegs();
   getLiveness();
-  for (unsigned n: VirtRegs)
-    Alias[n] = n;
 }
 
 
@@ -682,7 +679,6 @@ unsigned RAGraphColoring::getSpillWorklistNode() {
       minWeight = degree;
     }
   }
-  //if (bestNode == 0) return *SpillWorklist.begin();
   return bestNode;
 }
 
@@ -707,11 +703,25 @@ void RAGraphColoring::assignColors() {
     std::set<uint16_t> okColors = getPhysRegs(n);
     for (unsigned w: InterGraph->getAdj(n)) {
       std::set<unsigned> temp;
+      
       std::set_union(ColoredNodes.begin(), ColoredNodes.end(),
           UsedPhys.begin(), UsedPhys.end(),
           std::inserter(temp, temp.begin()));
+      
       if (temp.find(getAlias(w)) != temp.end()) {
-        okColors.erase(InterGraph->getColor(getAlias(w)));
+        unsigned colorNode = InterGraph->getColor(getAlias(w));
+        std::set<unsigned> subSuperRegs;
+        for (MCSubRegIterator I(colorNode, TRI); I.isValid(); ++I)
+          subSuperRegs.insert(*I);
+        for (MCSuperRegIterator I(colorNode, TRI); I.isValid(); ++I)
+          subSuperRegs.insert(*I);
+        subSuperRegs.insert(colorNode);
+        for (unsigned reg: subSuperRegs) {
+          if (okColors.find(reg) != okColors.end()) {
+            okColors.erase(reg);
+            break;
+          }
+        }
       }
     }
     if (okColors.empty()) {
