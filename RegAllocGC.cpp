@@ -1,9 +1,7 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/Analysis/AliasAnalysis.h"
-#include "llvm/CodeGen/CalcSpillWeights.h"
 #include "llvm/CodeGen/LiveIntervalAnalysis.h"
 #include "llvm/CodeGen/LiveRangeEdit.h"
-#include "llvm/CodeGen/LiveRegMatrix.h"
 #include "llvm/CodeGen/LiveStackAnalysis.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -32,11 +30,11 @@ using namespace llvm;
 #define DEBUG_TYPE "regalloc"
 
 namespace llvm{
-  FunctionPass* createSimpleRegisterAllocator();
+  FunctionPass* createGCRegisterAllocator();
 };
 
 static RegisterRegAlloc gcRegAlloc("gc", "graph coloring register allocator",
-    createSimpleRegisterAllocator);
+    createGCRegisterAllocator);
 
 namespace {
   class Graph {
@@ -110,17 +108,7 @@ namespace {
       LiveIntervals *LIS;
       SlotIndexes* SI;
 
-
-      //1st set is Uses regs; 2nd is Defs regs
-      typedef std::pair<std::set<unsigned>, std::set<unsigned>> RegsMap;
-      typedef std::unordered_map<MachineBasicBlock*, RegsMap>  BBRegsMap;
-      BBRegsMap BBRegs;
-
-
       std::set<unsigned> UsedPhys, VirtRegs;
-
-      std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveOutRegs;
-      std::unordered_map<MachineBasicBlock*, std::set<unsigned>> LiveInRegs;
 
       std::unordered_map<unsigned, std::set<MachineInstr*>> MoveList;
       std::set<MachineInstr*> WorklistMoves, ActiveMoves, CoalescedMoves, 
@@ -135,7 +123,7 @@ namespace {
       Graph* InterGraph;
 
       std::set<unsigned> SpillWorklist, FreezeWorklist, SimplifyWorklist,
-        CoalescedNodes, ColoredNodes, SpilledNodes, newTemps;
+        CoalescedNodes, ColoredNodes, SpilledNodes;
 
     public:
       RAGraphColoring();
@@ -155,11 +143,9 @@ namespace {
 
     private:
       void init(MachineFunction &MF);
-      void livenessAnalysis();
       void buildInterferenceGraph();
       void isGraphCorrect();
       void getAllRegs();
-      void getLiveness();
       void getSuccessor(MachineBasicBlock&, std::set<MachineBasicBlock*>&,
           std::set<unsigned>&, std::set<unsigned>&, bool&);
       void getUsesDefs(MachineInstr&, std::set<unsigned>&, std::set<unsigned>&);
@@ -196,38 +182,34 @@ namespace {
 }
 
 RAGraphColoring::RAGraphColoring(): MachineFunctionPass(ID) {
-  //initializeLiveIntervalsPass(*PassRegistry::getPassRegistry());
+  initializeLiveIntervalsPass(*PassRegistry::getPassRegistry());
   initializeSlotIndexesPass(*PassRegistry::getPassRegistry());
-  //initializeRegisterCoalescerPass(*PassRegistry::getPassRegistry());
-  //initializeMachineSchedulerPass(*PassRegistry::getPassRegistry());
-  //initializeLiveStacksPass(*PassRegistry::getPassRegistry());
-  //initializeMachineDominatorTreePass(*PassRegistry::getPassRegistry());
-  //initializeMachineLoopInfoPass(*PassRegistry::getPassRegistry());
+  initializeRegisterCoalescerPass(*PassRegistry::getPassRegistry());
+  initializeMachineSchedulerPass(*PassRegistry::getPassRegistry());
+  initializeLiveStacksPass(*PassRegistry::getPassRegistry());
+  initializeMachineDominatorTreePass(*PassRegistry::getPassRegistry());
+  initializeMachineLoopInfoPass(*PassRegistry::getPassRegistry());
   initializeVirtRegMapPass(*PassRegistry::getPassRegistry());
-  //initializeLiveRegMatrixPass(*PassRegistry::getPassRegistry());
 }
 
 void RAGraphColoring::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.setPreservesAll();
-  //AU.addRequiredID(PHIEliminationID);
-  //AU.addRequired<AliasAnalysis>();
-  //AU.addPreserved<AliasAnalysis>();
-  //AU.addRequired<LiveIntervals>();
-  //AU.addPreserved<LiveIntervals>();
+  AU.setPreservesCFG();
+  AU.addRequired<AliasAnalysis>();
+  AU.addPreserved<AliasAnalysis>();
+  AU.addRequired<LiveIntervals>();
+  AU.addPreserved<LiveIntervals>();
   AU.addPreserved<SlotIndexes>();
   AU.addRequired<SlotIndexes>();
-  //AU.addRequired<LiveStacks>();
-  //AU.addPreserved<LiveStacks>();
-  //AU.addRequired<MachineBlockFrequencyInfo>();
-  //AU.addPreserved<MachineBlockFrequencyInfo>();
-  //AU.addRequiredID(MachineDominatorsID);
-  //AU.addPreservedID(MachineDominatorsID);
-  //AU.addRequired<MachineLoopInfo>();
-  //AU.addPreserved<MachineLoopInfo>();
+  AU.addRequired<LiveStacks>();
+  AU.addPreserved<LiveStacks>();
+  AU.addRequired<MachineBlockFrequencyInfo>();
+  AU.addPreserved<MachineBlockFrequencyInfo>();
+  AU.addRequiredID(MachineDominatorsID);
+  AU.addPreservedID(MachineDominatorsID);
+  AU.addRequired<MachineLoopInfo>();
+  AU.addPreserved<MachineLoopInfo>();
   AU.addRequired<VirtRegMap>();
   AU.addPreserved<VirtRegMap>();
-  //AU.addRequired<LiveRegMatrix>();
-  //AU.addPreserved<LiveRegMatrix>();
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
@@ -239,8 +221,8 @@ void RAGraphColoring::init(MachineFunction &MF) {
   this->TRI = this->TM->getRegisterInfo();
   this->VRM = &getAnalysis<VirtRegMap>();
   this->SI  = &getAnalysis<SlotIndexes>();
-  //this->LIS = &getAnalysis<LiveIntervals>();
-  //MRI->freezeReservedRegs(VRM->getMachineFunction());
+  this->LIS = &getAnalysis<LiveIntervals>();
+  MRI->freezeReservedRegs(VRM->getMachineFunction());
   RegClassInfo.runOnMachineFunction(VRM->getMachineFunction());
 }
 
@@ -250,13 +232,11 @@ void RAGraphColoring::getAllRegs() {
       std::set<unsigned> uses, defs;
       getUsesDefs(Instr, uses, defs);
       for (unsigned reg: uses) {
-        BBRegs[&MBB].first.insert(reg);
         if (TRI->isVirtualRegister(reg))
           VirtRegs.insert(reg);
         else UsedPhys.insert(reg);
       }
       for (unsigned reg: defs) {
-        BBRegs[&MBB].second.insert(reg);
         if (TRI->isVirtualRegister(reg))
           VirtRegs.insert(reg);
         else UsedPhys.insert(reg);
@@ -264,50 +244,6 @@ void RAGraphColoring::getAllRegs() {
     }
   }
 }
-
-void RAGraphColoring::getLiveness() {
-  std::set<unsigned> oldIn, oldOut;
-
-  bool finished = false;
-  while (!finished) {
-    finished = true;
-    for (MachineBasicBlock& mbb: *MF) {
-      oldIn  = LiveInRegs[&mbb];
-      oldOut = LiveOutRegs[&mbb];
-
-      std::set<unsigned> temp;
-
-      LiveInRegs[&mbb].clear();
-
-      std::set_difference(LiveOutRegs[&mbb].begin(), LiveOutRegs[&mbb].end(),
-          BBRegs[&mbb].second.begin(), BBRegs[&mbb].second.end(),
-          std::inserter(temp, temp.begin()));
-
-      std::set_union(BBRegs[&mbb].first.begin(), BBRegs[&mbb].first.end(),
-          temp.begin(), temp.end(),
-          std::inserter(LiveInRegs[&mbb], LiveInRegs[&mbb].begin()));
-
-      LiveOutRegs[&mbb].clear();
-      if (!mbb.succ_empty()) {
-        for (MachineBasicBlock::succ_iterator succIt = mbb.succ_begin(); 
-            succIt != mbb.succ_end(); succIt++) {
-          MachineBasicBlock *mbbSucc = *succIt;
-          std::copy(LiveInRegs[mbbSucc].begin(), LiveInRegs[mbbSucc].end(),
-              std::inserter(LiveOutRegs[&mbb], LiveOutRegs[&mbb].begin()));
-        }
-      }
-
-      if ((LiveInRegs[&mbb] != oldIn) || (LiveOutRegs[&mbb] != oldOut))
-        finished = false;
-    }
-  }
-}
-
-void RAGraphColoring::livenessAnalysis() {
-  getAllRegs();
-  getLiveness();
-}
-
 
 void RAGraphColoring::getUsesDefs(MachineInstr& Instr, std::set<unsigned>& uses,
     std::set<unsigned>& defs) {
@@ -338,11 +274,8 @@ bool RAGraphColoring::isMoveInstr(MachineInstr& Instr) {
 }
 
 void RAGraphColoring::releaseMemory() {
-  BBRegs.clear();
   UsedPhys.clear();
   VirtRegs.clear();
-  LiveOutRegs.clear();
-  LiveInRegs.clear();
   SpillWorklist.clear();
   FreezeWorklist.clear();
   SimplifyWorklist.clear();
@@ -383,14 +316,12 @@ void RAGraphColoring::addEdge(unsigned u, unsigned v) {
 }
 
 void RAGraphColoring::buildInterferenceGraph() {
-  //if (InterGraph != nullptr) delete InterGraph;
-  
   InterGraph = new Graph();
 
   LiveOutSets* los = new LiveOutSets(*MF);
 
   for (MachineBasicBlock& MBB: *MF) {
-    std::set<unsigned> live(los->getAliveOutSet(&MBB));// = LiveOutRegs[&MBB];
+    std::set<unsigned> live(los->getAliveOutSet(&MBB));
     for (MachineBasicBlock::reverse_instr_iterator instrIt = MBB.instr_rbegin();
         instrIt != MBB.instr_rend(); instrIt++) {
       MachineInstr& Instr = *instrIt;
@@ -454,10 +385,6 @@ void RAGraphColoring::makeWorklist() {
     else
       SimplifyWorklist.insert(VirtReg);
   }
-  std::cout << SpillWorklist.size() << "\n";
-  std::cout << WorklistMoves.size() << "\n";
-  std::cout << FreezeWorklist.size() << "\n";
-  std::cout << SimplifyWorklist.size() << "\n\n";
 }
 
 std::set<MachineInstr*> RAGraphColoring::nodeMoves(unsigned node) {
@@ -764,7 +691,6 @@ void RAGraphColoring::rewriteProgram() {
           int FrameIdx = getStackSpaceFor(Reg);
           const TargetRegisterClass *RC = MRI->getRegClass(Reg);
           unsigned NewReg = MRI->createVirtualRegister(RC);
-          oper.setReg(NewReg);
           if (oper.isUse()) {
             TII->loadRegFromStackSlot(MBB, MI, NewReg, FrameIdx, RC, TRI);
           }
@@ -772,6 +698,7 @@ void RAGraphColoring::rewriteProgram() {
             TII->storeRegToStackSlot(MBB, next(MI), NewReg, oper.isKill(), FrameIdx, RC, TRI);
           }
           SI->repairIndexesInRange(&MBB, MBB.begin(), MBB.end());
+          oper.setReg(NewReg);
         }
       }
     }
@@ -793,10 +720,6 @@ void RAGraphColoring::isGraphCorrect() {
           std::cout << "Não vivas ao mesmo tempo, mas com aresta!\n";
     }
   }
-  //std::cout << InterGraph->getNodes().size() << " nodes\n";
-  //for (unsigned m: InterGraph->getNodes()) {
-  //  std::cout << m << ": " << InterGraph->getDegree(m) << "\n";
-  //}
 }
 
 bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
@@ -807,15 +730,12 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
 
   bool finished = false;
 
-  //calculateSpillWeightsAndHints(*LIS, *MF, getAnalysis<MachineLoopInfo>(),
-  //    getAnalysis<MachineBlockFrequencyInfo>());
-
   while (!finished) {
-    livenessAnalysis();
+    getAllRegs();
 
     buildInterferenceGraph();
 
-    //isGraphCorrect();
+    isGraphCorrect();
 
     makeWorklist();
 
@@ -831,33 +751,22 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
 
     finished = true;
     if (!SpilledNodes.empty()) {
-      std::cout << SpilledNodes.size() << " aa\n";
       finished = false;
       rewriteProgram();
       releaseMemory();
     }
   }
 
-
-  //int i = 0;
-  //for (int j = 0; j < MRI->getNumVirtRegs(); j++) {
-  //  unsigned Reg = TargetRegisterInfo::index2VirtReg(j);
-  //  if (MRI->reg_nodbg_empty(Reg)) {
-  //    //VRM->assignVirt2Phys(Reg, *getPhysRegs(Reg).begin());
-  //  }
-  //}
   VRM->clearAllVirt();
   for (unsigned n: VirtRegs) {
-    //std::cout << n << ": " << InterGraph->getColor(n) << "\n";
     VRM->assignVirt2Phys(n, InterGraph->getColor(n));
   }
-  //std::cout << MRI->getNumVirtRegs() << " aa\n";
 
   releaseMemory();
 
   return true;
 }
 
-FunctionPass* llvm::createSimpleRegisterAllocator() {
+FunctionPass* llvm::createGCRegisterAllocator() {
   return new RAGraphColoring();
 }
