@@ -101,6 +101,7 @@ namespace {
       MachineFunction *MF;            //check
       const TargetRegisterInfo *TRI;  //check
       const TargetMachine *TM;        //check
+      const TargetSubtargetInfo *STM;
       const TargetInstrInfo *TII;     //check
       MachineRegisterInfo *MRI;       //check
       VirtRegMap *VRM;                //check
@@ -217,6 +218,7 @@ void RAGraphColoring::init(MachineFunction &MF) {
   this->MF  = &MF;
   this->MRI = &this->MF->getRegInfo();
   this->TM  = &this->MF->getTarget();
+  this->STM = &this->MF->getSubtarget();
   this->TII = this->TM->getInstrInfo();
   this->TRI = this->TM->getRegisterInfo();
   this->VRM = &getAnalysis<VirtRegMap>();
