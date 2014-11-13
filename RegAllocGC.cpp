@@ -31,7 +31,7 @@ using namespace llvm;
 
 namespace llvm{
   FunctionPass* createGCRegisterAllocator();
-};
+}
 
 static RegisterRegAlloc gcRegAlloc("gc", "graph coloring register allocator",
     createGCRegisterAllocator);
@@ -118,6 +118,8 @@ namespace {
 
       std::unordered_map<unsigned, int> StackSlot;
 
+      unsigned spills;
+
       std::list<unsigned> Stack;
 
       Graph* InterGraph;
@@ -144,7 +146,6 @@ namespace {
     private:
       void init(MachineFunction &MF);
       void buildInterferenceGraph();
-      void isGraphCorrect();
       void getAllRegs();
       void getSuccessor(MachineBasicBlock&, std::set<MachineBasicBlock*>&,
           std::set<unsigned>&, std::set<unsigned>&, bool&);
@@ -290,6 +291,7 @@ void RAGraphColoring::releaseMemory() {
   SpilledNodes.clear();
   Alias.clear();
   StackSlot.clear();
+  spills = 0;
 }
 
 std::set<unsigned> RAGraphColoring::adjacent(unsigned n) {
@@ -705,26 +707,11 @@ void RAGraphColoring::rewriteProgram() {
   }
 }
 
-void RAGraphColoring::isGraphCorrect() {
-  for (unsigned n: VirtRegs) {
-    LiveInterval* li_n = &LIS->getInterval(n);
-    for (unsigned m: VirtRegs) {
-      if (n == m) continue;
-      LiveInterval* li_m = &LIS->getInterval(m);
-      if (li_n->overlaps(*li_m)){
-        if (!InterGraph->isAdjSet(n, m) || !InterGraph->hasEdge(n, m))
-          std::cout << "Vivas ao mesmo tempo, mas sem aresta!\n";
-      }
-      else
-        if (InterGraph->isAdjSet(n, m) || InterGraph->hasEdge(n, m))
-          std::cout << "Não vivas ao mesmo tempo, mas com aresta!\n";
-    }
-  }
-}
-
 bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
   DEBUG(dbgs() << "********** GRAPH COLORING REGISTER ALLOCATION **********\n"
       << "********** Function: "  << mf.getName() << '\n');
+
+  std::cout << std::string(mf.getName()) << ":\n";
 
   init(mf);
 
@@ -734,8 +721,6 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
     getAllRegs();
 
     buildInterferenceGraph();
-
-    isGraphCorrect();
 
     makeWorklist();
 
@@ -752,10 +737,15 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
     finished = true;
     if (!SpilledNodes.empty()) {
       finished = false;
+      spills += SpilledNodes.size();
       rewriteProgram();
       releaseMemory();
     }
   }
+
+  std::cout << "\tVirtual registers: " << VirtRegs.size() << "\n";
+  std::cout << "\tSpills: " << spills << "\n";
+
 
   VRM->clearAllVirt();
   for (unsigned n: VirtRegs) {
