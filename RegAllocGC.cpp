@@ -118,7 +118,7 @@ namespace {
 
       std::unordered_map<unsigned, int> StackSlot;
 
-      unsigned spills;
+      unsigned spills, removedMoves;
 
       std::list<unsigned> Stack;
 
@@ -744,8 +744,8 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
   }
 
   std::cout << "\tVirtual registers: " << VirtRegs.size() << "\n";
+  std::cout << "\tRemoved moves: " << CoalescedNodes.size() << "\n";
   std::cout << "\tSpills: " << spills << "\n";
-
 
   VRM->clearAllVirt();
   for (unsigned n: VirtRegs) {
