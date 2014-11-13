@@ -291,7 +291,6 @@ void RAGraphColoring::releaseMemory() {
   SpilledNodes.clear();
   Alias.clear();
   StackSlot.clear();
-  spills = 0;
 }
 
 std::set<unsigned> RAGraphColoring::adjacent(unsigned n) {
@@ -753,6 +752,8 @@ bool RAGraphColoring::runOnMachineFunction(MachineFunction &mf) {
   }
 
   releaseMemory();
+
+  spills = 0;
 
   return true;
 }
